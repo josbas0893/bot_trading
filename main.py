@@ -3,76 +3,30 @@ from datetime import datetime, UTC
 from email.message import EmailMessage
 
 import ccxt
-import numpy as np
 import pandas as pd
+import numpy as np
 
-from fastapi import FastAPI, Request
-import uvicorn
+from telegram import Bot
 from dotenv import load_dotenv
-
-from telegram import Bot, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 import joblib
 from sklearn.ensemble import RandomForestClassifier
 import ta
 
-# =========================
-# ENV / Secrets
-# =========================
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SMTP_EMAIL        = os.getenv("SMTP_EMAIL", "")
+SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
-SMTP_TO           = os.getenv("SMTP_TO", SMTP_EMAIL)
+SMTP_TO = os.getenv("SMTP_TO", SMTP_EMAIL)
 
 PROJECT_NAME = os.getenv("PROJECT_NAME", "BotSenalesSwing")
 
-EX_NAMES       = [s.strip() for s in os.getenv("EXCHANGES", "okx,kucoin,bybit,binance").split(",")]
-PAIRS_ENV      = os.getenv("PAIRS", "auto")
-MAX_PAIRS_ENV  = int(os.getenv("MAX_PAIRS", "150"))
-TV_SECRET      = os.getenv("TV_SECRET", "")
-
-RUN_EVERY_SEC = 300   # escaneo cada 5 minutos
-
-MODE = {"current": "soft"}   # arranque en modo suave para más señales
-MONITOR_ACTIVE = True
-
-MODE_CONFIG = {
-    "soft": {
-        "fib_tol": 0.010,
-        "ema_tol": 0.008,
-        "rsi_long": (35, 65),
-        "rsi_short": (35, 65),
-        "min_score": 50
-    },
-    "normal": {
-        "fib_tol": 0.006,
-        "ema_tol": 0.005,
-        "rsi_long": (40, 60),
-        "rsi_short": (40, 60),
-        "min_score": 65
-    },
-    "sniper": {
-        "fib_tol": 0.004,
-        "ema_tol": 0.003,
-        "rsi_long": (42, 58),
-        "rsi_short": (42, 58),
-        "min_score": 80
-    },
-}
-
-FIB_PULLBACK_LEVELS = [0.5, 0.618, 0.65, 0.75]
-ATR_MULT_SL = 1.8
-
-STATE = {
-    "last_sent": {}
-}
-
-DAILY_SIGNALS = []
+EX_NAMES = [s.strip() for s in os.getenv("EXCHANGES", "kucoin").split(",")]
+MAX_PAIRS_ENV = int(os.getenv("MAX_PAIRS", "100"))
+TIMEFRAMES = [s.strip() for s in os.getenv("TIMEFRAMES", "4h,1h,15m,5m").split(",")]
 
 EX_OBJS = {}
 
@@ -86,29 +40,31 @@ def init_exchanges():
             ex = klass(opts)
             ex.load_markets()
             EX_OBJS[name] = ex
-            print(f"✅ Conectado a {name} con {len(ex.symbols)} símbolos.")
+            print(f"Conectado a {name} con {len(ex.symbols)} símbolos.")
         except Exception as e:
-            print(f"⚠️ No se pudo iniciar {name}: {e}")
+            print(f"No se pudo iniciar {name}: {e}")
 
 init_exchanges()
 
 async def send_telegram_message(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram no configurado para avisos")
+        print("Telegram no configurado, no se manda mensaje.")
         return
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception as e:
         print("Error enviando Telegram:", e)
 
 def descargar_archivos():
     archivos = []
     hoy = datetime.now(UTC).strftime("%Y-%m-%d")
+    pairs_totales = 0
     for ex in EX_OBJS.values():
         pairs = [s for s in ex.symbols if "/USDT" in s and "PERP" in s][:MAX_PAIRS_ENV]
+        pairs_totales += len(pairs)
         for pair in pairs:
-            for tf in ['4h','1h','15m','5m']:
+            for tf in TIMEFRAMES:
                 try:
                     data = ex.fetch_ohlcv(pair, tf, limit=1000)
                     df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
@@ -118,7 +74,7 @@ def descargar_archivos():
                     print(f"Guardado: {filename}")
                 except Exception as e:
                     print(f"Error con {pair} {tf}: {e}")
-    return archivos
+    return archivos, pairs_totales
 
 def enviar_gmail(archivos):
     if not (SMTP_EMAIL and SMTP_APP_PASSWORD and SMTP_TO):
@@ -153,7 +109,6 @@ def entrenar_modelo():
         sys.exit(1)
 
     df_total = pd.DataFrame()
-
     for archivo in archivos:
         df = pd.read_csv(archivo)
         df['rsi'] = ta.momentum.rsi(df['close'], window=14)
@@ -168,33 +123,47 @@ def entrenar_modelo():
     model = RandomForestClassifier()
     model.fit(features, target)
     joblib.dump(model, "modelo_rf.pkl")
-    print("Modelo guardado como modelo_rf.pkl")
 
     score = model.score(features, target)
-    mensaje = f"Backtest accuracy (win rate): {score*100:.2f}%"
-    print(mensaje)
+    print(f"Backtest accuracy (win rate): {score*100:.2f}%")
 
-    import asyncio
+    return score
+
+async def main():
+    archivos, pares = descargar_archivos()
+    enviar_gmail(archivos)
+    limpiar_archivos(archivos)
+
+    score = entrenar_modelo()
+    validacion = "✅ Estrategia válida" if score >= 0.55 else "⚠️ Estrategia NO válida"
+    msg = (
+        f"Entrenamiento terminado para {pares} pares.\n"
+        f"Backtest accuracy: {score*100:.2f}%\n"
+        f"{validacion}"
+    )
+    await send_telegram_message(msg)
+
     if score < 0.55:
-        mensaje += "\n⚠️ Estrategia NO pasa validación. El bot NO se ejecutará hoy."
-        print(mensaje)
-        asyncio.run(send_telegram_message(mensaje))
+        print("Estrategia no válida, se detiene el bot.")
         import sys
         sys.exit(1)
-    else:
-        mensaje += "\n✅ Estrategia válida. El bot se ejecutará."
-        print(mensaje)
-        asyncio.run(send_telegram_message(mensaje))
 
-# Aquí pega todo tu código original (que me diste arriba) incluido con funciones async y telegram etc
+    print("Estrategia válida, el bot continúa.")
+
+    # Aquí puedes llamar la función que ejecuta todo el análisis y señales del bot
 # =========================
-# Bot de Señales — Swing 4H / Macro 1H / Confirm 30m / Gatillo 15m / Exec 5m
-# Compatible con Replit y Render (24/7 con keep-alive HTTP)
+# Bot de Señales — 4H/1H/30m/15m con 3 modos
+# Modos: suave, normal, sniper
+# Replit / Render ready (FastAPI + Telegram + ccxt)
 # =========================
 
-import os, re, time, math, asyncio, threading, smtplib, ssl, io
-from datetime import datetime, UTC
-from email.message import EmailMessage
+import os
+import re
+import time
+import math
+import asyncio
+import threading
+from datetime import datetime, timezone
 
 import ccxt
 import numpy as np
@@ -208,96 +177,111 @@ from telegram import Bot, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # =========================
-# ENV / Secrets
+# Carga de ENV / Secrets
 # =========================
+
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Gmail solo para adjuntar CSV/Excel (opcional)
-SMTP_EMAIL        = os.getenv("SMTP_EMAIL", "")
-SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
-SMTP_TO           = os.getenv("SMTP_TO", SMTP_EMAIL)
+PROJECT_NAME = os.getenv("PROJECT_NAME", "BotSenalesMultiTF")
 
-PROJECT_NAME = os.getenv("PROJECT_NAME", "BotSenalesSwing")
+EX_NAMES = [
+    s.strip() for s in os.getenv("EXCHANGES", "binance,okx,kucoin,bybit").split(",")
+    if s.strip()
+]
 
-# EXCHANGES: "okx,kucoin,bybit,binance"
-EX_NAMES       = [s.strip() for s in os.getenv("EXCHANGES", "okx,kucoin,bybit,binance").split(",")]
-# PAIRS: "auto" para dinámico, o "BTC/USDT,ETH/USDT,SOL/USDT"
-PAIRS_ENV      = os.getenv("PAIRS", "auto")
-MAX_PAIRS_ENV  = int(os.getenv("MAX_PAIRS", "150"))
-TV_SECRET      = os.getenv("TV_SECRET", "")
+PAIRS_ENV = os.getenv("PAIRS", "").strip()
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "150"))
+RUN_EVERY_SEC = int(os.getenv("RUN_EVERY_SEC", "300"))  # 5 minutos
+
+# Modo inicial (por env o normal por default)
+MODE = {"current": os.getenv("BOT_MODE", "normal").lower()}
+
+# Estado global
+STATE = {
+    "started": False,
+    "last_sent": {},  # (symbol, side) -> timestamp
+    "monitor_active": True,
+}
 
 # =========================
-# Parámetros generales
+# Configuración de modos
 # =========================
-RUN_EVERY_SEC = 300   # escaneo cada 5 minutos
-
-# Modos: soft, normal, sniper
-MODE = {"current": "normal"}   # arranque en NORMAL
-MONITOR_ACTIVE = True
 
 MODE_CONFIG = {
-    "soft": {
-        "fib_tol": 0.010,   # 1%
-        "ema_tol": 0.008,   # 0.8%
-        "rsi_long": (35, 65),
-        "rsi_short": (35, 65),
-        "min_score": 50
+    "suave": {
+        "score_threshold": 40,
+        "ema_tolerance": 0.012,     # 1.2% de tolerancia
+        "fib_margin": 0.03,         # ±3% margen en zona 0.5–0.75
+        "rsi_hook_delta": 4,        # delta mínimo RSI hook
+        "min_rr": 1.3,              # RR mínimo
+        "allow_eq_zone": True,
+        "require_ob_fvg": False,
     },
     "normal": {
-        "fib_tol": 0.006,   # 0.6%
-        "ema_tol": 0.005,   # 0.5%
-        "rsi_long": (40, 60),
-        "rsi_short": (40, 60),
-        "min_score": 65
+        "score_threshold": 55,
+        "ema_tolerance": 0.008,     # 0.8%
+        "fib_margin": 0.02,         # ±2%
+        "rsi_hook_delta": 3,
+        "min_rr": 1.6,
+        "allow_eq_zone": True,
+        "require_ob_fvg": False,
     },
     "sniper": {
-        "fib_tol": 0.004,   # 0.4%
-        "ema_tol": 0.003,   # 0.3%
-        "rsi_long": (42, 58),
-        "rsi_short": (42, 58),
-        "min_score": 80
+        "score_threshold": 70,
+        "ema_tolerance": 0.005,     # 0.5%
+        "fib_margin": 0.015,        # ±1.5%
+        "rsi_hook_delta": 2,
+        "min_rr": 2.0,
+        "allow_eq_zone": False,
+        "require_ob_fvg": True,
     },
 }
 
-FIB_PULLBACK_LEVELS = [0.5, 0.618, 0.65, 0.75]
-ATR_MULT_SL = 1.8
+# =========================
+# Timeframes usados
+# =========================
 
-STATE = {
-    "last_sent": {}   # (symbol, side) -> timestamp
-}
-
-DAILY_SIGNALS = []    # para Excel diario
+TF_SWING = "4h"   # Swing
+TF_MACRO = "1h"   # Macro obligatorio
+TF_CONFIRM = "30m"
+TF_TRIGGER = "15m"
+TF_EXEC = "5m"    # sólo para contexto extra si quieres usar luego
 
 # =========================
 # Exchanges (ccxt)
 # =========================
+
 EX_OBJS = {}
+
 
 def init_exchanges():
     for name in EX_NAMES:
         try:
             klass = getattr(ccxt, name)
-            opts = {"enableRateLimit": True}
+            ex = klass({"enableRateLimit": True})
+            # Algunos futuros
             if name in ("bybit", "kucoin"):
-                opts["options"] = {"defaultType": "future"}
-            ex = klass(opts)
+                ex.options["defaultType"] = "future"
             ex.load_markets()
             EX_OBJS[name] = ex
             print(f"✅ Conectado a {name} con {len(ex.symbols)} símbolos.")
         except Exception as e:
             print(f"⚠️ No se pudo iniciar {name}: {e}")
 
+
 def _basic_usdt_filter(symbol: str) -> bool:
     if not symbol.endswith("/USDT"):
         return False
-    if re.match(r"^(1000|1M|1MB|10K|B-|.*-).*?/USDT$", symbol):
+    # filtrar 1000PEPE, etc
+    if re.match(r"^(1000|10000|1M|10K|1K).*?/USDT$", symbol):
         return False
     if "PERP" in symbol.upper():
         return False
     return True
+
 
 def _collect_from(ex):
     try:
@@ -305,622 +289,732 @@ def _collect_from(ex):
     except Exception:
         return []
 
-def build_pairs_dynamic(limit=150):
-    agg, seen = [], set()
-    for name in EX_NAMES:
-        ex = EX_OBJS.get(name)
-        if not ex:
-            continue
-        for s in _collect_from(ex):
+
+def build_pairs_dynamic(limit: int = 150):
+    agg = []
+    seen = set()
+    for name, ex in EX_OBJS.items():
+        syms = _collect_from(ex)
+        for s in syms:
             if s not in seen:
-                agg.append(s); seen.add(s)
-            if len(agg) >= limit:
-                break
+                agg.append(s)
+                seen.add(s)
         if len(agg) >= limit:
             break
-    return sorted(agg)[:limit]
+    agg = sorted(agg)
+    return agg[:limit]
+
 
 init_exchanges()
 
-USER_PAIRS = []
-if PAIRS_ENV and PAIRS_ENV.strip().lower() != "auto":
+# PARES activos
+if PAIRS_ENV and PAIRS_ENV.lower() != "auto":
     USER_PAIRS = [s.strip() for s in PAIRS_ENV.split(",") if s.strip()]
+else:
+    USER_PAIRS = []
 
-DYN = build_pairs_dynamic(limit=MAX_PAIRS_ENV)
+DYN_PAIRS = build_pairs_dynamic(limit=MAX_PAIRS)
+
 if USER_PAIRS:
     seen = set()
     ACTIVE_PAIRS = []
-    for s in USER_PAIRS + DYN:
+    for s in USER_PAIRS + DYN_PAIRS:
         if s not in seen:
             ACTIVE_PAIRS.append(s)
             seen.add(s)
-    ACTIVE_PAIRS = ACTIVE_PAIRS[:MAX_PAIRS_ENV]
+    ACTIVE_PAIRS = ACTIVE_PAIRS[:MAX_PAIRS]
 else:
-    ACTIVE_PAIRS = DYN
+    ACTIVE_PAIRS = DYN_PAIRS
 
-print(f"📦 Pares a monitorear: {len(ACTIVE_PAIRS)} (modo pares={'manual+auto' if USER_PAIRS else 'auto'})")
+print(f"📦 Pares a monitorear: {len(ACTIVE_PAIRS)}")
 
 # =========================
-# Telegram helpers
+# Utilidades de indicadores
 # =========================
-async def send_tg(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
-        return
-    try:
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
-    except Exception as e:
-        print("❌ Telegram error:", e)
 
-async def startup_notice():
-    await send_tg(
-        f"✅ {PROJECT_NAME} iniciado\n"
-        f"🧭 Modo: <b>{MODE['current'].upper()}</b>\n"
-        f"📦 Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
-        f"⏱️ Escaneo cada <b>{RUN_EVERY_SEC//60} min</b>\n"
-        f"⛓️ Timeframes: 4H (swing) / 1H (macro) / 30m (confirm) / 15m (gatillo) / 5m (exec)"
-    )
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-def can_send(symbol: str, side: str) -> bool:
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.fillna(50)
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["EMA_12"] = ema(df["close"], 12)
+    df["EMA_20"] = ema(df["close"], 20)
+    df["EMA_50"] = ema(df["close"], 50)
+    df["EMA_100"] = ema(df["close"], 100)
+    df["EMA_200"] = ema(df["close"], 200)
+    df["RSI"] = rsi(df["close"], 14)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift(1)).abs(),
+            (df["low"] - df["close"].shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+    return df.dropna()
+
+
+# =========================
+# Smart zones / Fibo / OB
+# =========================
+
+def fetch_ohlcv_first_ok(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+    for ex in EX_OBJS.values():
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not data or len(data) < 20:
+                continue
+            df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+            # Quitamos vela actual
+            df = df.iloc[:-1].copy()
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            df.set_index("ts", inplace=True)
+            return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def premium_discount_zone(price: float, low: float, high: float):
+    if high <= low:
+        return "eq", (high + low) / 2.0
+    rng = high - low
+    d20 = low + rng * 0.2
+    d50 = low + rng * 0.5
+    d80 = low + rng * 0.8
+
+    if price <= d20:
+        return "deep_discount", d50
+    if d20 < price <= d50:
+        return "discount", d50
+    if d50 < price < d80:
+        return "eq", d50
+    return "premium", d50
+
+
+def find_ob(df: pd.DataFrame, is_long: bool, lookback: int = 60):
+    """
+    Order Block simple:
+    - LONG: última vela bajista antes de un rally alcista.
+    - SHORT: última vela alcista antes de un dump bajista.
+    """
+    if len(df) < lookback + 3:
+        return None
+
+    seg = df.tail(lookback + 3).iloc[:-2]  # excluye 2 últimas
+    for i in range(len(seg) - 1, 1, -1):
+        c = seg["close"].iloc[i]
+        o = seg["open"].iloc[i]
+        prev_c = seg["close"].iloc[i - 1]
+        prev_o = seg["open"].iloc[i - 1]
+
+        if is_long:
+            # rally alcista desde aquí
+            if c > o and prev_c < prev_o:
+                ob_candle = seg.iloc[i - 1]
+                return {
+                    "type": "bull",
+                    "level": float(ob_candle["open"]),
+                }
+        else:
+            if c < o and prev_c > prev_o:
+                ob_candle = seg.iloc[i - 1]
+                return {
+                    "type": "bear",
+                    "level": float(ob_candle["open"]),
+                }
+    return None
+
+
+def find_fvg(df: pd.DataFrame, max_scan: int = 80):
+    """
+    FVG clásico de 3 velas:
+    - bull gap: low3 > high1
+    - bear gap: high3 < low1
+    """
+    if len(df) < 3:
+        return None
+
+    hi = df["high"].values
+    lo = df["low"].values
+    n = len(df)
+
+    start = max(2, n - max_scan)
+    for i in range(n - 1, start - 1, -1):
+        i3 = i
+        i1 = i - 2
+        if i1 < 0:
+            break
+        # bull
+        if lo[i3] > hi[i1]:
+            return {
+                "type": "bull",
+                "gap": (float(hi[i1]), float(lo[i3])),
+            }
+        # bear
+        if hi[i3] < lo[i1]:
+            return {
+                "type": "bear",
+                "gap": (float(hi[i3]), float(lo[i1])),
+            }
+    return None
+
+
+# =========================
+# Bias de tendencia con EMAs
+# =========================
+
+def ema_trend_bias(df: pd.DataFrame):
+    """
+    Devuelve:
+      1  = alcista
+     -1  = bajista
+      0  = neutro
+    basado en 12/50/200 y cierre.
+    """
+    if len(df) < 60:
+        return 0
+    last = df.iloc[-1]
+    ema12 = last["EMA_12"]
+    ema50 = last["EMA_50"]
+    ema200 = last["EMA_200"]
+    close = last["close"]
+
+    # alcista
+    if close > ema50 and ema12 > ema50 > ema200:
+        return 1
+    # bajista
+    if close < ema50 and ema12 < ema50 < ema200:
+        return -1
+    return 0
+
+
+# =========================
+# Lógica de análisis por símbolo
+# =========================
+
+def golden_zone_factor(price: float, swing_low: float, swing_high: float):
+    if swing_high <= swing_low:
+        return None
+
+    # ratio de retroceso desde el high hacia el low
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return None
+    # Para LONG: cuanto ha retrocedido desde el high
+    retr_from_high = (swing_high - price) / rng
+    # Para SHORT: cuanto ha subido desde el low
+    retr_from_low = (price - swing_low) / rng
+
+    return retr_from_high, retr_from_low
+
+
+def analyze_symbol(symbol: str):
+    mode_name = MODE.get("current", "normal")
+    if mode_name not in MODE_CONFIG:
+        mode_name = "normal"
+        MODE["current"] = "normal"
+    cfg = MODE_CONFIG[mode_name]
+
+    # 1) Descargar velas
+    df4 = fetch_ohlcv_first_ok(symbol, TF_SWING, limit=350)
+    df1 = fetch_ohlcv_first_ok(symbol, TF_MACRO, limit=350)
+    df30 = fetch_ohlcv_first_ok(symbol, TF_CONFIRM, limit=350)
+    df15 = fetch_ohlcv_first_ok(symbol, TF_TRIGGER, limit=350)
+
+    if df4.empty or df1.empty or df30.empty or df15.empty:
+        return None
+
+    df4 = add_indicators(df4)
+    df1 = add_indicators(df1)
+    df30 = add_indicators(df30)
+    df15 = add_indicators(df15)
+
+    if df4.empty or df1.empty or df30.empty or df15.empty:
+        return None
+
+    # 2) Bias SWING (4H con EMA100 y EMA50)
+    last4 = df4.iloc[-1]
+    close4 = float(last4["close"])
+    ema50_4 = float(last4["EMA_50"])
+    ema100_4 = float(last4["EMA_100"])
+
+    swing_bias = 0
+    if close4 > ema100_4:
+        swing_bias = 1
+    elif close4 < ema100_4:
+        swing_bias = -1
+
+    # 3) Bias MACRO (1H) — OBLIGATORIO
+    macro_bias = ema_trend_bias(df1)
+    if macro_bias == 0:
+        return None  # no hay estructura clara
+
+    # Sólo operamos a favor del bias macro
+    is_long = macro_bias == 1
+    side = "LONG" if is_long else "SHORT"
+
+    score = 0
+    tags = []
+
+    # 4) Puntos por SWING
+    if swing_bias == macro_bias:
+        score += 20
+        tags.append("4H alineado (EMA100)")
+    elif swing_bias == 0:
+        score += 5
+        tags.append("4H neutro")
+    else:
+        # swing en contra
+        score -= 10
+        tags.append("4H en contra")
+
+        # en sniper no queremos swing en contra
+        if mode_name == "sniper":
+            return None
+
+    # 5) Confirmación 30m
+    bias_30 = ema_trend_bias(df30)
+    if bias_30 == macro_bias:
+        score += 10
+        tags.append("30m alineado")
+    elif bias_30 == 0:
+        tags.append("30m neutro")
+    else:
+        score -= 5
+        tags.append("30m en contra")
+        if mode_name in ("normal", "sniper"):
+            return None
+
+    # 6) Gatillo 15m: Hook EMA50 + RSI + Fibo golden zone
+    last15 = df15.iloc[-1]
+    prev15 = df15.iloc[-2]
+
+    close15 = float(last15["close"])
+    ema50_15 = float(last15["EMA_50"])
+    ema200_15 = float(last15["EMA_200"])
+    rsi15_now = float(last15["RSI"])
+    rsi15_prev = float(prev15["RSI"])
+
+    ema_tol = cfg["ema_tolerance"]
+
+    # precio cerca de EMA50
+    near_ema50 = abs(close15 - ema50_15) / max(close15, 1e-9) <= ema_tol
+
+    # hook RSI
+    rsi_hook_ok = False
+    if is_long:
+        # venía flojo, gira hacia arriba
+        if (rsi15_prev < 50) and (rsi15_now > 50) and (rsi15_now - rsi15_prev >= cfg["rsi_hook_delta"]):
+            rsi_hook_ok = True
+    else:
+        if (rsi15_prev > 50) and (rsi15_now < 50) and (rsi15_prev - rsi15_now >= cfg["rsi_hook_delta"]):
+            rsi_hook_ok = True
+
+    # swing para Fibo: usamos 1H
+    sw_lo_1h = float(df1["low"].tail(120).min())
+    sw_hi_1h = float(df1["high"].tail(120).max())
+    golden = golden_zone_factor(close15, sw_lo_1h, sw_hi_1h)
+    golden_ok = False
+    if golden is not None:
+        retr_from_high, retr_from_low = golden
+        if is_long:
+            # LONG: queremos retroceso desde el máximo entre 0.5 y 0.75 (± margen)
+            if 0.5 - cfg["fib_margin"] <= retr_from_high <= 0.75 + cfg["fib_margin"]:
+                golden_ok = True
+        else:
+            # SHORT: queremos retroceso desde el mínimo entre 0.5 y 0.75
+            if 0.5 - cfg["fib_margin"] <= retr_from_low <= 0.75 + cfg["fib_margin"]:
+                golden_ok = True
+
+    # Puntuación del gatillo
+    if near_ema50:
+        score += 10
+        tags.append("Rebote EMA50 15m")
+
+    if rsi_hook_ok:
+        score += 10
+        tags.append("RSI hook 15m")
+
+    if golden_ok:
+        score += 15
+        tags.append("Fibo 0.5–0.75 1H")
+
+    # En sniper, exigimos los 3 (EMA+RSI+Fibo)
+    if mode_name == "sniper":
+        if not (near_ema50 and rsi_hook_ok and golden_ok):
+            return None
+
+    # 7) Zona Premium / Discount (usamos rango 4H)
+    sw4_lo = float(df4["low"].tail(200).min())
+    sw4_hi = float(df4["high"].tail(200).max())
+    zone_name, eq_mid = premium_discount_zone(close15, sw4_lo, sw4_hi)
+
+    if is_long:
+        if zone_name in ("premium",):
+            score -= 15
+            tags.append(f"Zona {zone_name.upper()} (mala para LONG)")
+            if not cfg["allow_eq_zone"]:
+                return None
+        elif zone_name in ("discount", "deep_discount"):
+            score += 10
+            tags.append(f"Zona {zone_name.upper()} (buena para LONG)")
+        else:
+            tags.append("Zona EQ")
+    else:
+        if zone_name in ("discount", "deep_discount"):
+            score -= 15
+            tags.append(f"Zona {zone_name.upper()} (mala para SHORT)")
+            if not cfg["allow_eq_zone"]:
+                return None
+        elif zone_name in ("premium",):
+            score += 10
+            tags.append(f"Zona {zone_name.upper()} (buena para SHORT)")
+        else:
+            tags.append("Zona EQ")
+
+    # 8) OB y FVG en 15m para refinar
+    ob15 = find_ob(df15, is_long=is_long, lookback=60)
+    fvg15 = find_fvg(df15, max_scan=60)
+
+    if ob15 is not None:
+        ob_level = ob15["level"]
+        if abs(close15 - ob_level) / max(close15, 1e-9) <= ema_tol * 2:
+            score += 8
+            tags.append("Near OB 15m")
+
+    if fvg15 is not None:
+        if is_long and fvg15["type"] == "bull":
+            score += 7
+            tags.append("FVG bull 15m")
+        if not is_long and fvg15["type"] == "bear":
+            score += 7
+            tags.append("FVG bear 15m")
+
+    # En sniper exigimos OB o FVG a favor
+    if cfg["require_ob_fvg"]:
+        have_good_ob = ob15 is not None
+        have_good_fvg = fvg15 is not None
+        if not (have_good_ob or have_good_fvg):
+            return None
+
+    # 9) SL / TP con ATR y swing 1H
+    atr15 = float(last15["ATR"])
+    if atr15 <= 0:
+        return None
+
+    # SL basado en ATR + estructura
+    if is_long:
+        structural_sl = min(
+            sw_lo_1h,
+            close15 - atr15 * 2.0,
+            float(df15["low"].tail(20).min()),
+        )
+        risk = close15 - structural_sl
+        # TP1 ~ 1.5R, TP2 ~ 2.5R
+        tp1 = close15 + risk * 1.5
+        tp2 = close15 + risk * 2.5
+    else:
+        structural_sl = max(
+            sw_hi_1h,
+            close15 + atr15 * 2.0,
+            float(df15["high"].tail(20).max()),
+        )
+        risk = structural_sl - close15
+        tp1 = close15 - risk * 1.5
+        tp2 = close15 - risk * 2.5
+
+    if risk <= 0:
+        return None
+
+    rr1 = abs(tp1 - close15) / risk
+    if rr1 < cfg["min_rr"]:
+        tags.append(f"RR1 bajo ({rr1:.2f})")
+        # en sniper lo cortamos
+        if mode_name == "sniper":
+            return None
+    else:
+        tags.append(f"RR1 OK ({rr1:.2f})")
+        score += 5
+
+    # 10) Umbral de puntuación final
+    if score < cfg["score_threshold"]:
+        # no suficiente convergencia
+        return None
+
+    # Construimos resultado
+    result = {
+        "symbol": symbol,
+        "side": side,
+        "entry": close15,
+        "sl": structural_sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "score": score,
+        "mode": mode_name,
+        "zone": zone_name,
+        "tags": tags,
+        "tf": TF_TRIGGER,
+    }
+    return result
+
+
+# =========================
+# Anti-spam y helpers Telegram
+# =========================
+
+def can_send(symbol: str, side: str, min_minutes: int = 30) -> bool:
     key = (symbol, side)
-    t0 = STATE["last_sent"].get(key, 0)
-    # 30 minutos mínimo entre señales del mismo par y sentido
-    return (time.time() - t0) > 30 * 60
+    last_ts = STATE["last_sent"].get(key, 0)
+    return (time.time() - last_ts) > min_minutes * 60
+
 
 def mark_sent(symbol: str, side: str):
     STATE["last_sent"][(symbol, side)] = time.time()
+
 
 def fmt_price(x: float) -> str:
     try:
         if x < 1:
             return f"{x:.6f}"
-        elif x < 100:
+        if x < 100:
             return f"{x:.4f}"
-        else:
-            return f"{x:.2f}"
+        return f"{x:.2f}"
     except Exception:
         return str(x)
 
-def build_signal_message(symbol, side, tf_exec, entry, sl, tp1, tp2, tp3, score, ctx):
-    dir_emoji = "🟢 LONG 📈" if side == "LONG" else "🔴 SHORT 📉"
-    zona_txt = ctx.get("zona_valor", "EQ")
-    fib_txt = ctx.get("fib_txt", "")
-    rsi_txt = ctx.get("rsi_txt", "")
-    ema_txt = ctx.get("ema_txt", "")
-    patt_txt = ctx.get("patt_txt", "")
-    trend_txt = ctx.get("trend_txt", "")
 
-    return (
-        f"{'🟢' if side=='LONG' else '🔴'} SEÑAL {side} {'🟢' if side=='LONG' else '🔴'}\n\n"
-        f"💱 {symbol}\n"
-        f"📊 Exec: {tf_exec}\n"
-        f"⏱️ Modo: <b>{MODE['current'].upper()}</b>\n"
-        f"⭐ Score: <b>{score:.1f}</b>/100\n\n"
-        f"➡️ {dir_emoji}\n"
-        f"💰 Entrada: <code>{fmt_price(entry)}</code>\n"
-        f"🛑 SL: <code>{fmt_price(sl)}</code>\n"
-        f"🎯 TP1: <code>{fmt_price(tp1)}</code>\n"
-        f"🎯 TP2: <code>{fmt_price(tp2)}</code>\n"
-        f"🎯 TP3: <code>{fmt_price(tp3)}</code>\n\n"
-        f"📍 Zona: <b>{zona_txt}</b>\n"
-        f"📏 {fib_txt}\n"
-        f"📉 {rsi_txt}\n"
-        f"📐 {ema_txt}\n"
-        f"📈 {trend_txt}\n"
-        f"🧩 {patt_txt}\n\n"
-        f"⚠️ Gestiona riesgo, mueve SL a BE en TP1.\n"
-        f"No es consejo financiero, opera bajo tu propio criterio. 🍀"
-    )
-
-# =========================
-# Indicadores nativos (sin pandas_ta)
-# =========================
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    roll_up = gain.ewm(alpha=1/length, adjust=False).mean()
-    roll_down = loss.ewm(alpha=1/length, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val.fillna(50)
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df = df.copy()
-    df["EMA_12"]  = ema(df["close"], 12)
-    df["EMA_20"]  = ema(df["close"], 20)
-    df["EMA_50"]  = ema(df["close"], 50)
-    df["EMA_100"] = ema(df["close"], 100)
-    df["EMA_200"] = ema(df["close"], 200)
-    df["RSI"]     = rsi(df["close"], 14)
-
-    tr = pd.concat([
-        (df["high"] - df["low"]),
-        (df["high"] - df["close"].shift(1)).abs(),
-        (df["low"]  - df["close"].shift(1)).abs()
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
-    return df.dropna()
-
-def fetch_ohlcv_first_ok(symbol, timeframe, limit=500):
-    for _, ex in EX_OBJS.items():
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not data or len(data) < 50:
-                continue
-            df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-            # quitamos la última vela en curso
-            df = df.iloc[:-1].copy()
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-            df.set_index("ts", inplace=True)
-            return compute_indicators(df)
-        except Exception:
-            continue
-    return pd.DataFrame()
-
-# =========================
-# Lógica de tendencia, zona y patrones
-# =========================
-def trend_4h(df4):
-    last = df4.iloc[-1]
-    price = last["close"]
-    ema100 = last["EMA_100"]
-    if price > ema100 * 1.002:
-        return 1   # swing alcista
-    elif price < ema100 * 0.998:
-        return -1  # swing bajista
-    return 0
-
-def trend_tf_emas(df, bias_hint=None):
-    last = df.iloc[-1]
-    price = last["close"]
-    e12, e50, e200 = last["EMA_12"], last["EMA_50"], last["EMA_200"]
-
-    if price > e50 and e12 > e50 > e200:
-        return 1
-    if price < e50 and e12 < e50 < e200:
-        return -1
-    # si no hay tendencia clara, usa hint
-    return bias_hint or 0
-
-def detect_range_bias(df, bars=40):
-    seg = df.tail(bars)
-    high = seg["high"].max()
-    low  = seg["low"].min()
-    mid  = (high + low) / 2.0
-    last_price = seg["close"].iloc[-1]
-    first_price = seg["close"].iloc[0]
-    if last_price > mid and last_price > first_price * 1.002:
-        return 1   # rango pero empujando arriba
-    if last_price < mid and last_price < first_price * 0.998:
-        return -1  # rango pero empujando abajo
-    return 0
-
-def premium_discount(price, low, high):
-    if high <= low:
-        return "EQ"
-    r = high - low
-    discount = low + 0.3 * r
-    premium  = high - 0.3 * r
-    if price < discount:
-        return "DISCOUNT"
-    if price > premium:
-        return "PREMIUM"
-    return "EQ"
-
-def fib_pullback_ok(price, low, high, mode_name):
-    cfg = MODE_CONFIG[mode_name]
-    tol = cfg["fib_tol"]
-    if high <= low:
-        return False, ""
-    range_ = high - low
-    levels = {}
-    for r in FIB_PULLBACK_LEVELS:
-        lvl = high - range_ * r
-        levels[r] = lvl
-    for r, lvl in levels.items():
-        if abs(price - lvl) / max(lvl, 1e-9) <= tol:
-            return True, f"Pullback Fib {r:.3f} ({fmt_price(lvl)})"
-    return False, "Fuera de zona Fib"
-
-def rsi_hook(df, side, mode_name):
-    cfg = MODE_CONFIG[mode_name]
-    rsi_lo, rsi_hi = (cfg["rsi_long"] if side == "LONG" else cfg["rsi_short"])
-    if len(df) < 5:
-        return False, "RSI insuficiente"
-    rsi_vals = df["RSI"].iloc[-3:]
-    r0, r1, r2 = rsi_vals.iloc[0], rsi_vals.iloc[1], rsi_vals.iloc[2]
-    if side == "LONG":
-        ok_range = rsi_lo <= r2 <= rsi_hi
-        giro = (r2 > r1) and (r1 >= r0)
-        return (ok_range and giro), f"RSI giro ↑ ({r2:.1f})"
-    else:
-        ok_range = rsi_lo <= r2 <= rsi_hi
-        giro = (r2 < r1) and (r1 <= r0)
-        return (ok_range and giro), f"RSI giro ↓ ({r2:.1f})"
-
-def ema_touch(df, side, mode_name):
-    cfg = MODE_CONFIG[mode_name]
-    tol = cfg["ema_tol"]
-    last = df.iloc[-1]
-    price = last["close"]
-    ema50 = last["EMA_50"]
-    ema200 = last["EMA_200"]
-    near_ema50 = abs(price - ema50) / max(price, 1e-9) <= tol
-    if side == "LONG":
-        cond = (price >= ema50) and (ema50 >= ema200 * 0.995)
-        return (cond and near_ema50), f"Hook EMA50↑ ({fmt_price(ema50)})"
-    else:
-        cond = (price <= ema50) and (ema50 <= ema200 * 1.005)
-        return (cond and near_ema50), f"Hook EMA50↓ ({fmt_price(ema50)})"
-
-def micro_confirm_5m(df5, side):
-    last = df5.iloc[-1]
-    prev = df5.iloc[-2]
-    price = last["close"]
-    ema20 = last["EMA_20"]
-    ema50 = last["EMA_50"]
-    if side == "LONG":
-        cond1 = price > ema20 > ema50
-        cond2 = last["close"] > last["open"] >= prev["close"]
-        return cond1 and cond2, "5m a favor (velas verdes)"
-    else:
-        cond1 = price < ema20 < ema50
-        cond2 = last["close"] < last["open"] <= prev["close"]
-        return cond1 and cond2, "5m a favor (velas rojas)"
-
-def double_top_bottom(df, bars=40, tol=0.004):
-    seg = df.tail(bars)
-    hi = seg["high"].values
-    lo = seg["low"].values
-    max1 = hi.max()
-    min1 = lo.min()
-    last_hi = seg["high"].tail(bars//2).max()
-    last_lo = seg["low"].tail(bars//2).min()
-    two_top = abs(last_hi - max1) / max(max1, 1e-9) <= tol
-    two_bot = abs(last_lo - min1) / max(min1, 1e-9) <= tol
-    return two_top, two_bot
-
-# =========================
-# TP / SL usando swing 1H
-# =========================
-def compute_tp_sl_from_1h(side, entry, df1, df15, df5):
-    # swings
-    sw1_hi = df1["high"].tail(120).max()
-    sw1_lo = df1["low"].tail(120).min()
-    sw15_hi = df15["high"].tail(60).max()
-    sw15_lo = df15["low"].tail(60).min()
-    atr_exec = df5["ATR"].iloc[-1]
-    if side == "LONG":
-        risk_zone = min(sw15_lo, entry - ATR_MULT_SL * atr_exec)
-        sl = float(risk_zone)
-        r = sw1_hi - sw1_lo
-        tp1 = entry + r * 0.382
-        tp2 = entry + r * 0.618
-        tp3 = entry + r * 1.0
-    else:
-        risk_zone = max(sw15_hi, entry + ATR_MULT_SL * atr_exec)
-        sl = float(risk_zone)
-        r = sw1_hi - sw1_lo
-        tp1 = entry - r * 0.382
-        tp2 = entry - r * 0.618
-        tp3 = entry - r * 1.0
-    return float(tp1), float(tp2), float(tp3), float(sl)
-
-# =========================
-# ANALYSIS PRINCIPAL
-# =========================
-def analyze_symbol(symbol: str):
-    mode_name = MODE["current"]
-    cfg = MODE_CONFIG.get(mode_name, MODE_CONFIG["normal"])
-
-    # Timeframes
-    tf_swing = "4h"
-    tf_macro = "1h"
-    tf_conf  = "30m"
-    tf_trig  = "15m"
-    tf_exec  = "5m"
-
-    df4  = fetch_ohlcv_first_ok(symbol, tf_swing, limit=300)
-    df1  = fetch_ohlcv_first_ok(symbol, tf_macro, limit=300)
-    df30 = fetch_ohlcv_first_ok(symbol, tf_conf,  limit=300)
-    df15 = fetch_ohlcv_first_ok(symbol, tf_trig,  limit=300)
-    df5  = fetch_ohlcv_first_ok(symbol, tf_exec,  limit=300)
-
-    if any(d.empty for d in [df4, df1, df30, df15, df5]):
-        return None
-
-    # 1) Swing 4H
-    swing_dir = trend_4h(df4)
-    if swing_dir == 0:
-        return None  # sin swing claro
-
-    # 2) Macro 1H obligatorio
-    macro_dir = trend_tf_emas(df1, bias_hint=swing_dir)
-    if macro_dir == 0 or macro_dir != swing_dir:
-        return None
-
-    side = "LONG" if macro_dir > 0 else "SHORT"
-
-    # 3) Confirm 30m (suma score)
-    conf_dir = trend_tf_emas(df30, bias_hint=macro_dir)
-    score = 0.0
-    trend_notes = []
-
-    if conf_dir == macro_dir:
-        score += 20
-        trend_notes.append("30m alineado con 1H/4H")
-    else:
-        trend_notes.append("30m neutro / en contra")
-
-    # 4) Gatillo 15m → pullback + EMA50 + RSI
-    last15 = df15.iloc[-1]
-    price15 = float(last15["close"])
-    sw15_hi = df15["high"].tail(80).max()
-    sw15_lo = df15["low"].tail(80).min()
-
-    fib_ok, fib_txt = fib_pullback_ok(price15, sw15_lo, sw15_hi, mode_name)
-    if not fib_ok:
-        return None
-    score += 20
-
-    rsi_ok, rsi_txt = rsi_hook(df15, side, mode_name)
-    if not rsi_ok:
-        return None
-    score += 15
-
-    ema_ok, ema_txt = ema_touch(df15, side, mode_name)
-    if not ema_ok:
-        return None
-    score += 15
-
-    zona = premium_discount(price15, sw15_lo, sw15_hi)
-    if side == "LONG" and zona == "DISCOUNT":
-        score += 15
-    elif side == "SHORT" and zona == "PREMIUM":
-        score += 15
-    elif zona == "EQ":
-        # rango: revisa hacia dónde empuja
-        rbias = detect_range_bias(df15)
-        if (side == "LONG" and rbias > 0) or (side == "SHORT" and rbias < 0):
-            score += 5
-        else:
-            score -= 5
-
-    zona_valor = zona
-
-    # 5) Exec 5m: micro confirm
-    micro_ok, micro_txt = micro_confirm_5m(df5, side)
-    if not micro_ok:
-        return None
-    score += 10
-
-    # 6) Patrones simples en 15m
-    two_top, two_bot = double_top_bottom(df15, bars=40, tol=0.004)
-    patt = []
-    if side == "LONG" and two_bot:
-        score += 5
-        patt.append("Doble Suelo 15m")
-    if side == "SHORT" and two_top:
-        score += 5
-        patt.append("Doble Techo 15m")
-    patt_txt = ", ".join(patt) if patt else "Sin patrón fuerte"
-
-    # check score vs modo
-    if score < cfg["min_score"]:
-        return None
-
-    # 7) TP/SL desde swing 1H
-    entry = float(df5["close"].iloc[-1])
-    tp1, tp2, tp3, sl = compute_tp_sl_from_1h(side, entry, df1, df15, df5)
-
-    # RR mínimo razonable
-    risk = abs(entry - sl)
-    rr1  = abs(tp1 - entry) / max(risk, 1e-9)
-    if rr1 < 1.3:  # no queremos RR basura
-        return None
-
-    ctx = {
-        "zona_valor": zona_valor,
-        "fib_txt": fib_txt,
-        "rsi_txt": rsi_txt,
-        "ema_txt": ema_txt,
-        "patt_txt": patt_txt,
-        "trend_txt": "; ".join(trend_notes + [micro_txt])
-    }
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "tf_exec": tf_exec,
-        "score": score,
-        "ctx": ctx
-    }
-
-# =========================
-# Registro + Gmail
-# =========================
-def register_signal(d: dict):
-    x = dict(d)
-    x["ts"] = datetime.now(UTC).isoformat()
-    DAILY_SIGNALS.append(x)
-
-def send_email_with_attachments(subject: str, body: str, attachments: list):
-    if not (SMTP_EMAIL and SMTP_APP_PASSWORD and SMTP_TO):
-        print("⚠️ SMTP no configurado; salto envío.")
+async def send_tg(text: str, chat_id: str | None = None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID no configurados")
         return
-    msg = EmailMessage()
-    msg["From"] = SMTP_EMAIL
-    msg["To"]   = SMTP_TO
-    msg["Subject"] = subject
-    msg.set_content(body)
-    for filename, file_bytes, mime in attachments:
-        maintype, subtype = mime.split("/")
-        msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=filename)
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
-        s.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
-        s.send_message(msg)
+    try:
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(
+            chat_id=chat_id or TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print("❌ Error Telegram:", e)
 
-async def email_daily_signals_excel():
-    if not DAILY_SIGNALS:
-        return
-    df = pd.DataFrame(DAILY_SIGNALS)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="signals")
-    buf.seek(0)
-    day = datetime.now(UTC).strftime("%Y-%m-%d")
-    send_email_with_attachments(
-        f"[{PROJECT_NAME}] Señales {day}",
-        f"Adjunto Excel con señales del {day} (UTC).",
-        [(f"signals_{day}.xlsx",
-          buf.read(),
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")]
-    )
-    DAILY_SIGNALS.clear()
+
+def build_signal_message(d: dict) -> str:
+    symbol = d["symbol"]
+    side = d["side"]
+    entry = d["entry"]
+    sl = d["sl"]
+    tp1 = d["tp1"]
+    tp2 = d["tp2"]
+    mode_name = d["mode"]
+    zone = d["zone"]
+    score = d["score"]
+    tags = d["tags"]
+    tf = d["tf"]
+
+    emoji_side = "🟢 LONG 📈" if side == "LONG" else "🔴 SHORT 📉"
+
+    txt = []
+    txt.append("✨ SEÑAL DETECTADA (MultiTF) ✨")
+    txt.append("")
+    txt.append(f"{emoji_side}")
+    txt.append(f"💱 Par: <b>{symbol}</b>")
+    txt.append(f"🕒 Temporalidad gatillo: <b>{tf}</b>")
+    txt.append(f"⚙️ Modo: <b>{mode_name.upper()}</b>")
+    txt.append(f"📊 Score: <b>{score}</b>")
+    txt.append(f"📌 Zona: <b>{zone.upper()}</b>")
+    txt.append("")
+    txt.append(f"🎯 Entrada: <code>{fmt_price(entry)}</code>")
+    txt.append(f"🛑 SL: <code>{fmt_price(sl)}</code>")
+    txt.append(f"✅ TP1: <code>{fmt_price(tp1)}</code>")
+    txt.append(f"✅ TP2: <code>{fmt_price(tp2)}</code>")
+    txt.append("")
+    txt.append("🧠 Confirmaciones:")
+    for t in tags:
+        txt.append(f"• {t}")
+    txt.append("")
+    txt.append("⚠️ Gestiona riesgo, ajusta tamaño de posición y SL según tu capital.")
+    return "\n".join(txt)
+
 
 # =========================
-# Comandos Telegram
+# Comandos de Telegram
 # =========================
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MONITOR_ACTIVE
-    MONITOR_ACTIVE = True
-    await send_tg("✅ Bot ACTIVADO (seguimiento continuo).")
+    STATE["monitor_active"] = True
+    msg = (
+        f"✅ Bot ACTIVADO\n"
+        f"📦 Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
+        f"⏱️ Escaneo cada <b>{RUN_EVERY_SEC//60} min</b>\n"
+        f"⚙️ Modo actual: <b>{MODE['current'].upper()}</b>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MONITOR_ACTIVE
-    MONITOR_ACTIVE = False
-    await send_tg("🛑 Bot DETENIDO (no se escanean pares).")
+    STATE["monitor_active"] = False
+    await update.message.reply_text("🛑 Bot DETENIDO.", parse_mode="HTML")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_tg(
+    last_pairs = len(ACTIVE_PAIRS)
+    msg = (
         f"📊 <b>ESTADO</b>\n"
+        f"• Pares: <b>{last_pairs}</b>\n"
         f"• Modo: <b>{MODE['current'].upper()}</b>\n"
-        f"• Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
-        f"• Monitoreo: <b>{'ACTIVO' if MONITOR_ACTIVE else 'DETENIDO'}</b>"
+        f"• Monitoreo: <b>{'ACTIVO' if STATE['monitor_active'] else 'DETENIDO'}</b>\n"
+        f"• Intervalo: <b>{RUN_EVERY_SEC//60} min</b>"
     )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip().lower().split()
-    if len(txt) >= 2 and txt[1] in ("soft","normal","sniper"):
+    if len(txt) >= 2 and txt[1] in MODE_CONFIG.keys():
         MODE["current"] = txt[1]
-        await send_tg(f"⚙️ Modo cambiado a <b>{MODE['current'].upper()}</b>.")
+        await update.message.reply_text(
+            f"⚙️ Modo cambiado a <b>{MODE['current'].upper()}</b>",
+            parse_mode="HTML",
+        )
     else:
-        await send_tg("Usa: <code>/mode soft</code>, <code>/mode normal</code> o <code>/mode sniper</code>")
+        available = ", ".join(MODE_CONFIG.keys())
+        await update.message.reply_text(
+            f"Usa: <code>/mode suave</code>, <code>/mode normal</code> o <code>/mode sniper</code>\n"
+            f"Modos disponibles: {available}",
+            parse_mode="HTML",
+        )
 
-# =========================
-# Loops principales
-# =========================
-async def monitor_loop():
-    await startup_notice()
-    while True:
-        if not MONITOR_ACTIVE:
-            await asyncio.sleep(3)
-            continue
-        print(f"[{datetime.now(UTC).strftime('%H:%M:%S')}] Escaneando {len(ACTIVE_PAIRS)} pares…")
-        for sym in ACTIVE_PAIRS:
-            try:
-                res = analyze_symbol(sym)
-                if not res:
-                    continue
-                side = res["side"]
-                if not can_send(sym, side):
-                    continue
-
-                msg = build_signal_message(
-                    res["symbol"], res["side"], res["tf_exec"],
-                    res["entry"], res["sl"],
-                    res["tp1"], res["tp2"], res["tp3"],
-                    res["score"], res["ctx"]
-                )
-                await send_tg(msg)
-                register_signal(res)
-                mark_sent(sym, side)
-            except Exception as e:
-                print(f"⚠️ Error analizando {sym}: {e}")
-        await asyncio.sleep(RUN_EVERY_SEC)
-
-async def scheduler_loop():
-    last_day = None
-    while True:
-        now = datetime.now(UTC)
-        day = now.date()
-        if last_day is None:
-            last_day = day
-        # al cambio de día (00:05 UTC) manda el Excel
-        if day != last_day and now.hour == 0 and now.minute >= 5:
-            try:
-                await email_daily_signals_excel()
-            except Exception as e:
-                print("email_daily_signals_excel error:", e)
-            last_day = day
-        await asyncio.sleep(30)
-
-# =========================
-# FastAPI (keep-alive / TV hook)
-# =========================
-app = FastAPI()
-
-@app.get("/ping")
-async def ping():
-    return {"ok": True, "service": PROJECT_NAME, "time": datetime.now(UTC).isoformat()}
-
-@app.post("/tv")
-async def tv_webhook(req: Request):
-    if not TV_SECRET:
-        return {"ok": False, "error": "TV_SECRET not set"}
-    data = await req.json()
-    if data.get("secret") != TV_SECRET:
-        return {"ok": False, "error": "bad secret"}
-    symbol = data.get("symbol")
-    price  = data.get("price")
-    tf     = data.get("tf") or data.get("interval")
-    ts     = data.get("time") or datetime.now(UTC).isoformat()
-    msg = f"📈 TV Signal\nSymbol: {symbol}\nTF: {tf}\nPrice: {price}\nTime: {ts}"
-    await send_tg(msg)
-    register_signal({"symbol":symbol,"side":"TV","entry":float(price or 0), "sl":0,"tp1":0,"tp2":0,"tp3":0,"tf_exec":tf,"score":0,"ctx":{},"source":"tv"})
-    return {"ok": True}
-
-def start_http():
-    def _run():
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT","8080")), log_level="warning")
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
 
 def start_telegram_bot():
     if not TELEGRAM_BOT_TOKEN:
-        print("⚠️ Falta TELEGRAM_BOT_TOKEN, no arranco Telegram.")
+        print("⚠️ TELEGRAM_BOT_TOKEN no configurado, no se inicia Telegram.")
         return
+
     app_tg = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app_tg.add_handler(CommandHandler("start",  cmd_start))
-    app_tg.add_handler(CommandHandler("stop",   cmd_stop))
+    app_tg.add_handler(CommandHandler("start", cmd_start))
+    app_tg.add_handler(CommandHandler("stop", cmd_stop))
     app_tg.add_handler(CommandHandler("status", cmd_status))
-    app_tg.add_handler(CommandHandler("mode",   cmd_mode))
+    app_tg.add_handler(CommandHandler("mode", cmd_mode))
 
     def _run():
         app_tg.run_polling()
+
     th = threading.Thread(target=_run, daemon=True)
     th.start()
+
+
+# =========================
+# FastAPI para /ping y Render keep-alive
+# =========================
+
+app = FastAPI()
+
+
+@app.get("/ping")
+async def ping():
+    return {
+        "ok": True,
+        "service": PROJECT_NAME,
+        "mode": MODE.get("current", "normal"),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/tv")
+async def tv_webhook(req: Request):
+    data = await req.json()
+    symbol = data.get("symbol")
+    price = data.get("price")
+    tf = data.get("tf") or data.get("interval")
+    ts = data.get("time") or datetime.now(timezone.utc).isoformat()
+    msg = (
+        f"📈 Señal externa TV\n"
+        f"Symbol: {symbol}\nTF: {tf}\nPrice: {price}\nTime: {ts}"
+    )
+    await send_tg(msg)
+    return {"ok": True}
+
+
+def start_http():
+    def _run():
+        port = int(os.getenv("PORT", "8080"))
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+
+
+# =========================
+# Bucle principal de monitoreo
+# =========================
+
+async def monitor_loop():
+    # Mensaje de inicio una sola vez
+    global STATE
+    if not STATE["started"]:
+        STATE["started"] = True
+        start_msg = (
+            f"✅ {PROJECT_NAME} iniciado\n"
+            f"📦 Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
+            f"⏱️ Escaneo: cada <b>{RUN_EVERY_SEC//60} min</b>\n"
+            f"⚙️ Modo inicial: <b>{MODE['current'].upper()}</b>"
+        )
+        await send_tg(start_msg)
+
+    while True:
+        if not STATE["monitor_active"]:
+            await asyncio.sleep(3)
+            continue
+
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        print(f"[{now}] Escaneando {len(ACTIVE_PAIRS)} pares — modo {MODE['current']}")
+
+        for symbol in ACTIVE_PAIRS:
+            try:
+                res = analyze_symbol(symbol)
+                if not res:
+                    continue
+
+                side = res["side"]
+                if not can_send(symbol, side, min_minutes=30):
+                    continue
+
+                msg = build_signal_message(res)
+                await send_tg(msg)
+                mark_sent(symbol, side)
+
+            except Exception as e:
+                print(f"⚠️ Error analizando {symbol}: {e}")
+
+        await asyncio.sleep(RUN_EVERY_SEC)
+
+
+# =========================
+# Entrypoint
+# =========================
 
 async def main_async():
     start_http()
     start_telegram_bot()
-    await asyncio.gather(
-        monitor_loop(),
-        scheduler_loop(),
-    )
+    await monitor_loop()
+
 
 if __name__ == "__main__":
     try:
@@ -930,51 +1024,8 @@ if __name__ == "__main__":
         loop.create_task(main_async())
         loop.run_forever()
 
-async def ejecutar_bot():
-    print("Ejecutando lógica completa del bot con modo suave y modelo entrenado...")
-
-    MODEL_PATH = "modelo_rf.pkl"
-    modelo = joblib.load(MODEL_PATH)
-
-    # El código original de análisis de señales viene aquí, adaptado para usar el modelo IA y modo suave
-    # Para brevedad aquí un ejemplo que puedes ampliar
-
-    for exchange_name, ex in EX_OBJS.items():
-        symbols = [s for s in ex.symbols if "/USDT" in s and "PERP" in s][:MAX_PAIRS_ENV]
-
-        for symbol in symbols:
-            try:
-                bars = ex.fetch_ohlcv(symbol, '1h', limit=100)
-                df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
-                df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-                df['ema20'] = ta.trend.ema_indicator(df['close'], window=20)
-
-                features = df.iloc[-1][['rsi', 'ema20']].values.reshape(1, -1)
-                prediccion = modelo.predict(features)[0]
-
-                config = MODE_CONFIG[MODE['current']]
-
-                # Aquí puede ir más lógica para combinar señales del modelo con otros indicadores
-                # Cerrando con un mensaje de ejemplo
-
-                if prediccion == 1:
-                    mensaje = f"📈 Señal LONG para {symbol} en modo {MODE['current']}"
-                else:
-                    mensaje = f"📉 Señal SHORT para {symbol} en modo {MODE['current']}"
-
-                print(mensaje)
-                await send_telegram_message(mensaje)
-
-                time.sleep(1)  # Pausa para evitar rate limit
-            except Exception as e:
-                print(f"Error en {symbol}: {e}")
-
 
 if __name__ == "__main__":
-    archivos = descargar_archivos()
-    enviar_gmail(archivos)
-    limpiar_archivos(archivos)
-    entrenar_modelo()
     import asyncio
-    asyncio.run(ejecutar_bot())
+    asyncio.run(main())
 
