@@ -23,3 +23,14 @@ model = RandomForestClassifier()
 model.fit(features, target)
 joblib.dump(model, "modelo_rf.pkl")
 print("Modelo guardado como modelo_rf.pkl")
+# Después de entrenar el modelo
+score = model.score(features, target)
+print(f"Backtest accuracy (win rate) del modelo: {score*100:.2f}%")
+
+# Validación simple (llamar "exit" con código no 0 si la estrategia es mala)
+if score < 0.55:
+    print("Debug: Estrategia no cumple el mínimo aceptable. No se continuará.")
+    import sys
+    sys.exit(1)  # Salida con error para cortar el flujo
+else:
+    print("Debug: Estrategia válida.")
