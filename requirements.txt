@@ -6,3 +6,6 @@ ccxt
 pandas
 numpy
 openpyxl
+scikit-learn
+joblib
+ta
