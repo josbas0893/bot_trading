@@ -9,3 +9,8 @@ openpyxl
 scikit-learn
 joblib
 ta
+ccxt
+pandas
+python-dotenv
+smtplib
+openpyxl
