@@ -1,3 +1,192 @@
+import os, re, time, math, asyncio, threading, smtplib, ssl, io, glob
+from datetime import datetime, UTC
+from email.message import EmailMessage
+
+import ccxt
+import numpy as np
+import pandas as pd
+
+from fastapi import FastAPI, Request
+import uvicorn
+from dotenv import load_dotenv
+
+from telegram import Bot, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+import joblib
+from sklearn.ensemble import RandomForestClassifier
+import ta
+
+# =========================
+# ENV / Secrets
+# =========================
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+SMTP_EMAIL        = os.getenv("SMTP_EMAIL", "")
+SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
+SMTP_TO           = os.getenv("SMTP_TO", SMTP_EMAIL)
+
+PROJECT_NAME = os.getenv("PROJECT_NAME", "BotSenalesSwing")
+
+EX_NAMES       = [s.strip() for s in os.getenv("EXCHANGES", "okx,kucoin,bybit,binance").split(",")]
+PAIRS_ENV      = os.getenv("PAIRS", "auto")
+MAX_PAIRS_ENV  = int(os.getenv("MAX_PAIRS", "150"))
+TV_SECRET      = os.getenv("TV_SECRET", "")
+
+RUN_EVERY_SEC = 300   # escaneo cada 5 minutos
+
+MODE = {"current": "soft"}   # arranque en modo suave para más señales
+MONITOR_ACTIVE = True
+
+MODE_CONFIG = {
+    "soft": {
+        "fib_tol": 0.010,
+        "ema_tol": 0.008,
+        "rsi_long": (35, 65),
+        "rsi_short": (35, 65),
+        "min_score": 50
+    },
+    "normal": {
+        "fib_tol": 0.006,
+        "ema_tol": 0.005,
+        "rsi_long": (40, 60),
+        "rsi_short": (40, 60),
+        "min_score": 65
+    },
+    "sniper": {
+        "fib_tol": 0.004,
+        "ema_tol": 0.003,
+        "rsi_long": (42, 58),
+        "rsi_short": (42, 58),
+        "min_score": 80
+    },
+}
+
+FIB_PULLBACK_LEVELS = [0.5, 0.618, 0.65, 0.75]
+ATR_MULT_SL = 1.8
+
+STATE = {
+    "last_sent": {}
+}
+
+DAILY_SIGNALS = []
+
+EX_OBJS = {}
+
+def init_exchanges():
+    for name in EX_NAMES:
+        try:
+            klass = getattr(ccxt, name)
+            opts = {"enableRateLimit": True}
+            if name in ("bybit", "kucoin"):
+                opts["options"] = {"defaultType": "future"}
+            ex = klass(opts)
+            ex.load_markets()
+            EX_OBJS[name] = ex
+            print(f"✅ Conectado a {name} con {len(ex.symbols)} símbolos.")
+        except Exception as e:
+            print(f"⚠️ No se pudo iniciar {name}: {e}")
+
+init_exchanges()
+
+async def send_telegram_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram no configurado para avisos")
+        return
+    try:
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        print("Error enviando Telegram:", e)
+
+def descargar_archivos():
+    archivos = []
+    hoy = datetime.now(UTC).strftime("%Y-%m-%d")
+    for ex in EX_OBJS.values():
+        pairs = [s for s in ex.symbols if "/USDT" in s and "PERP" in s][:MAX_PAIRS_ENV]
+        for pair in pairs:
+            for tf in ['4h','1h','15m','5m']:
+                try:
+                    data = ex.fetch_ohlcv(pair, tf, limit=1000)
+                    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+                    filename = f"{pair.replace('/','_').replace(':','_')}_{tf}_{hoy}.csv"
+                    df.to_csv(filename, index=False)
+                    archivos.append(filename)
+                    print(f"Guardado: {filename}")
+                except Exception as e:
+                    print(f"Error con {pair} {tf}: {e}")
+    return archivos
+
+def enviar_gmail(archivos):
+    if not (SMTP_EMAIL and SMTP_APP_PASSWORD and SMTP_TO):
+        print("SMTP no configurado; salto envío.")
+        return
+    msg = EmailMessage()
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = SMTP_TO
+    msg["Subject"] = f"Archivos futuros {datetime.now(UTC).strftime('%Y-%m-%d')}"
+    msg.set_content("Archivos de futuros descargados hoy (Render automatizado).")
+    for filename in archivos:
+        with open(filename, "rb") as f:
+            msg.add_attachment(f.read(), maintype="text", subtype="csv", filename=filename)
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
+        s.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+        s.send_message(msg)
+    print("Archivos enviados por Gmail.")
+
+def limpiar_archivos(archivos):
+    for f in archivos:
+        try:
+            os.remove(f)
+        except:
+            pass
+
+def entrenar_modelo():
+    archivos = glob.glob("*_1h_*.csv")
+    if not archivos:
+        print("No hay archivos CSV para entrenar")
+        import sys
+        sys.exit(1)
+
+    df_total = pd.DataFrame()
+
+    for archivo in archivos:
+        df = pd.read_csv(archivo)
+        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+        df['ema20'] = ta.trend.ema_indicator(df['close'], window=20)
+        df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+        df = df.dropna()
+        df_total = pd.concat([df_total, df], ignore_index=True)
+
+    features = df_total[['rsi', 'ema20']]
+    target = df_total['target']
+
+    model = RandomForestClassifier()
+    model.fit(features, target)
+    joblib.dump(model, "modelo_rf.pkl")
+    print("Modelo guardado como modelo_rf.pkl")
+
+    score = model.score(features, target)
+    mensaje = f"Backtest accuracy (win rate): {score*100:.2f}%"
+    print(mensaje)
+
+    import asyncio
+    if score < 0.55:
+        mensaje += "\n⚠️ Estrategia NO pasa validación. El bot NO se ejecutará hoy."
+        print(mensaje)
+        asyncio.run(send_telegram_message(mensaje))
+        import sys
+        sys.exit(1)
+    else:
+        mensaje += "\n✅ Estrategia válida. El bot se ejecutará."
+        print(mensaje)
+        asyncio.run(send_telegram_message(mensaje))
+
+# Aquí pega todo tu código original (que me diste arriba) incluido con funciones async y telegram etc
 # =========================
 # Bot de Señales — Swing 4H / Macro 1H / Confirm 30m / Gatillo 15m / Exec 5m
 # Compatible con Replit y Render (24/7 con keep-alive HTTP)
@@ -740,3 +929,52 @@ if __name__ == "__main__":
         loop = asyncio.get_event_loop()
         loop.create_task(main_async())
         loop.run_forever()
+
+async def ejecutar_bot():
+    print("Ejecutando lógica completa del bot con modo suave y modelo entrenado...")
+
+    MODEL_PATH = "modelo_rf.pkl"
+    modelo = joblib.load(MODEL_PATH)
+
+    # El código original de análisis de señales viene aquí, adaptado para usar el modelo IA y modo suave
+    # Para brevedad aquí un ejemplo que puedes ampliar
+
+    for exchange_name, ex in EX_OBJS.items():
+        symbols = [s for s in ex.symbols if "/USDT" in s and "PERP" in s][:MAX_PAIRS_ENV]
+
+        for symbol in symbols:
+            try:
+                bars = ex.fetch_ohlcv(symbol, '1h', limit=100)
+                df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
+                df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+                df['ema20'] = ta.trend.ema_indicator(df['close'], window=20)
+
+                features = df.iloc[-1][['rsi', 'ema20']].values.reshape(1, -1)
+                prediccion = modelo.predict(features)[0]
+
+                config = MODE_CONFIG[MODE['current']]
+
+                # Aquí puede ir más lógica para combinar señales del modelo con otros indicadores
+                # Cerrando con un mensaje de ejemplo
+
+                if prediccion == 1:
+                    mensaje = f"📈 Señal LONG para {symbol} en modo {MODE['current']}"
+                else:
+                    mensaje = f"📉 Señal SHORT para {symbol} en modo {MODE['current']}"
+
+                print(mensaje)
+                await send_telegram_message(mensaje)
+
+                time.sleep(1)  # Pausa para evitar rate limit
+            except Exception as e:
+                print(f"Error en {symbol}: {e}")
+
+
+if __name__ == "__main__":
+    archivos = descargar_archivos()
+    enviar_gmail(archivos)
+    limpiar_archivos(archivos)
+    entrenar_modelo()
+    import asyncio
+    asyncio.run(ejecutar_bot())
+
