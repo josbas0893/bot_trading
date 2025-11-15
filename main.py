@@ -1,70 +1,117 @@
-# ======================================================================
-# Bot V4 – Render 24/7  (polars, modos dinámicos, filtros IA/reglas)
-# - Multi-exchange (Kucoin/OKX...)
-# - Sin python-telegram-bot (usa requests directo)
-# - Sin Bitunix (solo /USDT de los exchanges disponibles)
-# - Estrategia "semi-monstruosa":
-#     * Bias 4h (EMA100)
-#     * Trend 1h (EMA12/50/200)
-#     * Setup 5m (EMA + RSI + rango + volumen)
-#     * Swings + BOS/CHoCH
-#     * FVG recientes como confluencia
-# ======================================================================
+# =========================
+# Bot de Señales V2 — Replit/Render 24/7
+# - Multi-exchange (ccxt)
+# - Multi-timeframe 4h / 1h / 15m / 5m
+# - Modos: suave / normal / sniper
+# - Señales por Telegram + Excel diario + comando /excel
+# =========================
 
-import os, time, asyncio, threading
+import os, re, time, math, asyncio, threading, smtplib, ssl, io
 from datetime import datetime, UTC
-from collections import defaultdict
+from email.message import EmailMessage
 
 import ccxt
 import numpy as np
-import polars as pl
-import requests
+import pandas as pd
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import uvicorn
 from dotenv import load_dotenv
 
+from telegram import Bot, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# =========================
+# ENV / Secrets
+# =========================
 load_dotenv()
 
-# ---------- CONFIG ----------
-EXCHANGES           = ["kucoin", "bybit", "binance", "okx"]   # fuente de datos
-MAX_PAIRS           = int(os.getenv("MAX_PAIRS", "120"))
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-PROJECT_NAME        = os.getenv("PROJECT_NAME", "BotV4")
-RUN_EVERY_SEC       = int(os.getenv("RUN_EVERY_SEC", "300"))
-DATA_DIR            = "data"
-BACKTEST_DAYS       = 60     # referencia, no filtro duro estricto
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ---------- MODOS DINÁMICOS ----------
-MODOS = {
-    "suave":  {"wr": 0.50, "trades": 3,  "desc": "Suave – más señales"},
-    "normal": {"wr": 0.65, "trades": 10, "desc": "Normal – balance"},
-    "sniper": {"wr": 0.80, "trades": 20, "desc": "Sniper – muy selectivo"}
+# Gmail para adjuntar CSV/Excel
+SMTP_EMAIL        = os.getenv("SMTP_EMAIL", "")
+SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
+SMTP_TO           = os.getenv("SMTP_TO", SMTP_EMAIL)
+
+PROJECT_NAME = os.getenv("PROJECT_NAME", "BotSenalesV2")
+
+EX_NAMES       = [s.strip() for s in os.getenv("EXCHANGES", "okx,kucoin,bybit,binance").split(",")]
+PAIRS_ENV      = os.getenv("PAIRS", "")
+TIMEFRAMES_ENV = os.getenv("TIMEFRAMES", "5m,15m")
+MAX_PAIRS_ENV  = int(os.getenv("MAX_PAIRS", "150"))
+TV_SECRET      = os.getenv("TV_SECRET", "")
+
+# =========================
+# Parámetros generales
+# =========================
+FIB_RET = [0.382, 0.5, 0.618, 0.786]
+FIB_EXT = [0.618, 0.75, 1.0, 1.272, 1.414, 1.618, 2.0, 2.272, 2.618]
+FIB_TIME_LEVELS = [0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.618]
+TIME_TOL_BARS   = 2
+
+RET_TOL   = 0.004   # 0.4% sniper
+ATR_MULT  = 1.8
+RUN_EVERY_SEC = 300  # escaneo cada 5 min
+MIN_RR    = 1.8      # RR mínimo
+
+# 3 modos: suave / normal / sniper
+CONFIG = {
+    "MODES": {
+        # Macro:
+        # 4h = "Swing"
+        # 1h = "Macro"
+        # 30m = "Confirm" (si quisieras usarlo luego)
+        # Aquí usamos 4h/1h/15m/5m, pero el esquema permite 30m si se quiere extender.
+        "intraday_5m":  {"MACRO":"4h", "CONFIRM":"1h", "CONFIRM2":"15m", "EXECUTION":"5m"},
+        "intraday_15m": {"MACRO":"4h", "CONFIRM":"1h", "CONFIRM2":"15m", "EXECUTION":"15m"},
+    },
+    "ACTIVE_MODES": ["intraday_5m"],  # la de 5m es la principal, puedes añadir "intraday_15m" si quieres
+    "EMA": {"fast":15, "slow":50, "long":200, "ultra_fast":12},
+    "RSI": {"period":14, "hi":70, "lo":30},
+    "CONSOLIDATION_BARS": 4
 }
-MODE = {"current": "normal"}   # modo por defecto
 
-# score mínimo por modo (1–7 puntos aprox.)
-SCORE_MIN = {
-    "suave":  3,
-    "normal": 4,
-    "sniper": 5,
+# modos de sensibilidad
+# - suave: filtros más relajados -> más señales
+# - normal: intermedio
+# - sniper: lo más estricto
+MODE = {
+    "current": "normal"  # "suave", "normal", "sniper"
+}
+
+STATE = {
+    "started": False,
+    "last_sent": {}  # (symbol, side) -> timestamp
 }
 
 MONITOR_ACTIVE = True
-STATE = {
-    "last_sent": {},                   # (symbol, side) -> timestamp
-    "daily_count": defaultdict(int),   # (symbol, side, date) -> count
-    "last_reset": datetime.now(UTC).date()
-}
-DAILY_SIGNALS = []
 
-# ====================================================================
-# EXCHANGES
-# ====================================================================
+# Parámetros relax / sensibilidad
+RELAX = {
+    # en "suave"
+    "RET_TOL_SUAVE": 0.008,   # ±0.8%
+    "EMA_SOFT_EPS_SUAVE": 0.002,  # 0.2%
+    "RSI_LONG_SUAVE":  (30, 65),
+    "RSI_SHORT_SUAVE": (35, 70),
+
+    # en "normal"
+    "RET_TOL_NORMAL": 0.006,   # ±0.6%
+    "EMA_SOFT_EPS_NORMAL": 0.001,  # 0.1%
+    "RSI_LONG_NORMAL":  (35, 60),
+    "RSI_SHORT_NORMAL": (40, 65),
+
+    # en "sniper" usamos RET_TOL y filtros duros
+    "ALLOW_NO_FVG_NORMAL": True
+}
+
+# =========================
+# Exchanges (ccxt)
+# =========================
 EX_OBJS = {}
+
 def init_exchanges():
-    for name in EXCHANGES:
+    for name in EX_NAMES:
         try:
             klass = getattr(ccxt, name)
             opts = {"enableRateLimit": True}
@@ -73,538 +120,894 @@ def init_exchanges():
             ex = klass(opts)
             ex.load_markets()
             EX_OBJS[name] = ex
-            print(f"✅ {name} con {len(ex.symbols)} símbolos")
+            print(f"✅ Conectado a {name} con {len(ex.symbols)} símbolos.")
         except Exception as e:
             print(f"⚠️ No se pudo iniciar {name}: {e}")
+
+def _basic_usdt_filter(symbol: str) -> bool:
+    if not symbol.endswith("/USDT"):
+        return False
+    # filtro de shitcoins rarísimas
+    if re.match(r"^(1000|1M|1MB|10K|B-|.*-).*?/USDT$", symbol):
+        return False
+    if "PERP" in symbol.upper():
+        return False
+    return True
+
+def _collect_from(ex):
+    try:
+        return [s for s in ex.symbols if _basic_usdt_filter(s)]
+    except:
+        return []
+
+def build_pairs_dynamic(limit=150):
+    agg, seen = [], set()
+    for name in EX_NAMES:
+        ex = EX_OBJS.get(name)
+        if not ex:
+            continue
+        syms = _collect_from(ex)
+        for s in syms:
+            if s not in seen:
+                agg.append(s)
+                seen.add(s)
+        if len(agg) >= limit:
+            break
+    return sorted(agg)[:limit]
+
 init_exchanges()
 
-# ====================================================================
-# UTILS / TELEGRAM
-# ====================================================================
-def now_ts():
-    return datetime.now(UTC)
+# ===== PARES (MODO MIXTO: auto + fallback manual) =====
+USER_PAIRS = []
+if PAIRS_ENV and PAIRS_ENV.strip().lower() != "auto":
+    USER_PAIRS = [s.strip() for s in PAIRS_ENV.split(",") if s.strip()]
 
-async def send_tg(text: str):
-    """
-    Envío async a Telegram usando requests en un executor (no bloquea el loop).
-    """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TG SIMULADO]\n{text}\n{'-'*40}")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-
-    def _post():
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            if not r.ok:
-                print(f"❌ Telegram {r.status_code}: {r.text}")
-        except Exception as e:
-            print(f"❌ Error enviando a Telegram: {e}")
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _post)
-
-def ensure_daily_reset():
-    """Resetea contadores diarios a medianoche UTC."""
-    today = now_ts().date()
-    if today != STATE["last_reset"]:
-        STATE["last_reset"] = today
-        STATE["daily_count"].clear()
-        DAILY_SIGNALS.clear()
-        print("🔄 Reset diario de contadores")
-
-# ====================================================================
-# DESCARGA DE VELAS (multi-exchange)
-# ====================================================================
-def csv_path(symbol, tf):
-    return f"{DATA_DIR}/{tf}/{symbol.replace('/', '_')}_{tf}.csv"
-
-def ensure_dirs():
-    for tf in ["5m", "15m", "1h", "4h"]:
-        os.makedirs(f"{DATA_DIR}/{tf}", exist_ok=True)
-
-def download_once(symbol, tf, limit=1500):
-    for ex in EX_OBJS.values():
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            df = pl.DataFrame(
-                data,
-                schema=["ts", "open", "high", "low", "close", "volume"]
-            )
-            df = df.with_columns(pl.col("ts").cast(pl.Int64))
-            df.write_csv(csv_path(symbol, tf))
-            return df
-        except Exception:
-            continue
-    return pl.DataFrame()
-
-def load_or_download(symbol, tf):
-    path = csv_path(symbol, tf)
-    if os.path.exists(path):
-        return pl.read_csv(path, dtypes={"ts": pl.Int64})
-    return download_once(symbol, tf)
-
-async def download_all_pares():
-    ensure_dirs()
-    pairs = build_pairs_list()
-    total_rows = 0
-    t0 = time.time()
-    for sym in pairs:
-        for tf in ["4h", "1h", "15m", "5m"]:
-            df = download_once(sym, tf)
-            total_rows += len(df)
-    elapsed = time.time() - t0
-    await send_tg(
-        f"📥 Descarga inicial completa\n"
-        f"🗂️  Pares: {len(pairs)}\n"
-        f"📊 Filas: {total_rows/1e6:.1f} M\n"
-        f"⏱️ Tiempo: {elapsed/60:.1f} min"
-    )
-    return pairs
-
-# ====================================================================
-# CONSTRUCCIÓN DE PARES (/USDT) – SIN BITUNIX, solo multi-exchange
-# ====================================================================
-def build_pairs_list():
-    """
-    Devuelve lista agregada de pares que terminen en /USDT de los exchanges
-    disponibles (kucoin, okx, etc.) hasta MAX_PAIRS.
-    """
-    agg = []
+DYN = build_pairs_dynamic(limit=MAX_PAIRS_ENV)
+if USER_PAIRS:
     seen = set()
+    ACTIVE_PAIRS = []
+    for s in USER_PAIRS + DYN:
+        if s not in seen:
+            ACTIVE_PAIRS.append(s)
+            seen.add(s)
+    ACTIVE_PAIRS = ACTIVE_PAIRS[:MAX_PAIRS_ENV]
+else:
+    ACTIVE_PAIRS = DYN
 
-    for name, ex in EX_OBJS.items():
-        try:
-            syms = [s for s in ex.symbols if s.endswith("/USDT")]
-            for s in syms:
-                if s not in seen:
-                    agg.append(s)
-                    seen.add(s)
-                if len(agg) >= MAX_PAIRS:
-                    break
-            if len(agg) >= MAX_PAIRS:
-                break
-        except Exception as e:
-            print(f"⚠️ Error leyendo símbolos de {name}: {e}")
+TIMEFRAMES  = [s.strip() for s in TIMEFRAMES_ENV.split(",") if s.strip()]
+print(f"📦 Pares a monitorear: {len(ACTIVE_PAIRS)} (mixto={'sí' if USER_PAIRS else 'no'})")
 
-    agg = sorted(agg)[:MAX_PAIRS]
-    print(f"📌 Pares compilados SIN Bitunix: {len(agg)} encontrados")
-    return agg
-
-# ====================================================================
-# HELPERS DE VOLATILIDAD / SWINGS / FVG
-# ====================================================================
-def has_min_daily_range(df5: pl.DataFrame, min_pct: float = 0.015) -> bool:
-    """
-    Comprueba que el rango medio diario (high-low) sea al menos min_pct del precio medio.
-    Evita pares que se mueven muy poquito (lateral aburrido).
-    """
-    if len(df5) < 100:
-        return False
-    window = 288
-    df_last = df5 if len(df5) < window else df5.tail(window)
-    mid_price = df_last["close"].mean()
-    avg_range = (df_last["high"] - df_last["low"]).mean()
-    if mid_price is None or avg_range is None:
-        return False
+# =========================
+# Telegram helpers
+# =========================
+async def send_tg(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID no configurados.")
+        return
     try:
-        return float(avg_range) / float(mid_price) >= min_pct
-    except ZeroDivisionError:
-        return False
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        print("❌ Telegram error:", e)
 
-def detect_swings(df: pl.DataFrame, lookback: int = 2) -> pl.DataFrame:
-    """
-    Marca swings HH/LL simples. Trabaja sobre df (típicamente tail(200)).
-    """
-    n = df.height
-    if n < lookback * 2 + 1:
-        return df.with_columns(
-            pl.lit(False).alias("is_swing_high"),
-            pl.lit(False).alias("is_swing_low")
-        )
-
-    highs = df["high"].to_list()
-    lows  = df["low"].to_list()
-    sh = [False] * n
-    sl = [False] * n
-
-    for i in range(lookback, n - lookback):
-        hi = highs[i]
-        lo = lows[i]
-        if all(hi > highs[j] for j in range(i - lookback, i + lookback + 1) if j != i):
-            sh[i] = True
-        if all(lo < lows[j] for j in range(i - lookback, i + lookback + 1) if j != i):
-            sl[i] = True
-
-    return df.with_columns(
-        pl.Series("is_swing_high", sh),
-        pl.Series("is_swing_low", sl)
-    )
-
-def get_bos_direction(df_sw: pl.DataFrame):
-    """
-    Detecta BOS/CHoCH simple basado en últimos dos swings.
-    Devuelve 'bull', 'bear' o None.
-    """
-    if "is_swing_high" not in df_sw.columns or "is_swing_low" not in df_sw.columns:
-        return None
-
-    sh_idx = [i for i, v in enumerate(df_sw["is_swing_high"]) if v]
-    sl_idx = [i for i, v in enumerate(df_sw["is_swing_low"]) if v]
-
-    bos_bull = False
-    bos_bear = False
-
-    if len(sh_idx) >= 2:
-        last, prev = sh_idx[-1], sh_idx[-2]
-        if df_sw["high"][last] > df_sw["high"][prev]:
-            bos_bull = True
-
-    if len(sl_idx) >= 2:
-        last, prev = sl_idx[-1], sl_idx[-2]
-        if df_sw["low"][last] < df_sw["low"][prev]:
-            bos_bear = True
-
-    if bos_bull and not bos_bear:
-        return "bull"
-    if bos_bear and not bos_bull:
-        return "bear"
-    return None
-
-def detect_recent_fvg(df: pl.DataFrame):
-    """
-    Detecta un FVG reciente (últimas ~8 velas).
-    Devuelve dict {'side': 'LONG'/'SHORT', 'mid': precio_medio_gap} o None.
-    Usamos FVG de 3 velas:
-        Bullish: low[i] > high[i-2]
-        Bearish: high[i] < low[i-2]
-    """
-    n = df.height
-    if n < 3:
-        return None
-
-    highs = df["high"].to_list()
-    lows  = df["low"].to_list()
-    start = max(2, n - 8)
-
-    for i in range(n - 1, start - 1, -1):
-        hi2 = highs[i - 2]
-        lo2 = lows[i - 2]
-        hi  = highs[i]
-        lo  = lows[i]
-
-        # Bullish FVG
-        if lo > hi2:
-            mid = (lo + hi2) / 2.0
-            return {"side": "LONG", "mid": mid}
-        # Bearish FVG
-        if hi < lo2:
-            mid = (hi + lo2) / 2.0
-            return {"side": "SHORT", "mid": mid}
-
-    return None
-
-# ====================================================================
-# INDICADORES BÁSICOS (EMA/RSI) para cualquier TF
-# ====================================================================
-def compute_indicators(df: pl.DataFrame) -> pl.DataFrame:
-    df = df.with_columns(
-        EMA_12=pl.col("close").ewm_mean(span=12),
-        EMA_50=pl.col("close").ewm_mean(span=50),
-        EMA_200=pl.col("close").ewm_mean(span=200),
-    )
-    delta = pl.col("close").diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    roll_up = gain.ewm_mean(alpha=1/14)
-    roll_down = loss.ewm_mean(alpha=1/14)
-    rs = roll_up / roll_down.replace(0, None)
-    df = df.with_columns(RSI=100 - (100 / (1 + rs)))
-    return df.drop_nulls()
-
-# ====================================================================
-# BACK-TEST INDIVIDUAL (ligero) – usa solo 5m + EMAs + RSI
-# ====================================================================
-def backtest_pare(symbol):
-    df5 = load_or_download(symbol, "5m")
-    if len(df5) < 500:
-        return {"trades": 0, "wr": 0.0, "df": pl.DataFrame()}
-    if not has_min_daily_range(df5, min_pct=0.015):
-        return {"trades": 0, "wr": 0.0, "df": pl.DataFrame()}
-
-    df5 = df5.with_columns(
-        EMA_12=pl.col("close").ewm_mean(span=12),
-        EMA_50=pl.col("close").ewm_mean(span=50),
-        EMA_200=pl.col("close").ewm_mean(span=200),
-    )
-    delta = pl.col("close").diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    roll_up = gain.ewm_mean(alpha=1/14)
-    roll_down = loss.ewm_mean(alpha=1/14)
-    rs = roll_up / roll_down.replace(0, None)
-    df5 = df5.with_columns(RSI=100 - (100 / (1 + rs)))
-
-    trades = []
-    for i in range(60, len(df5) - 20):
-        c     = df5["close"][i]
-        ema12 = df5["EMA_12"][i]
-        ema50 = df5["EMA_50"][i]
-        ema200= df5["EMA_200"][i]
-        rsi   = df5["RSI"][i]
-        if pl.is_nan(c):
-            continue
-
-        is_long = None
-        # Condición base de estrategia (versión ligera)
-        if c > ema200*0.998 and ema12 > ema50*0.998 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
-            is_long = True
-        elif c < ema200*1.002 and ema12 < ema50*1.002 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
-            is_long = False
-
-        if is_long is None:
-            continue
-
-        atr = (df5["high"][i] - df5["low"][i]).rolling_mean(14)[i]
-        if pl.is_nan(atr):
-            continue
-
-        sl  = c - atr*1.8 if is_long else c + atr*1.8
-        tp1 = c + atr*1.8*1.5 if is_long else c - atr*1.8*1.5
-
-        fut = df5[i+1:i+21]
-        if len(fut) < 2:
-            continue
-
-        if is_long:
-            sl_hit = (fut["low"] <= sl).any()
-            tp_hit = (fut["high"] >= tp1).any()
-        else:
-            sl_hit = (fut["high"] >= sl).any()
-            tp_hit = (fut["low"]  <= tp1).any()
-
-        if sl_hit and not tp_hit:
-            trades.append(-1.0)
-        elif tp_hit:
-            trades.append(1.5)
-
-    df_trades = pl.DataFrame({"R": trades}) if trades else pl.DataFrame({"R": []})
-    wr = (df_trades["R"] > 0).mean() if len(df_trades) else 0.0
-    return {"trades": len(df_trades), "wr": float(wr or 0.0), "df": df_trades}
-
-# ====================================================================
-# MENSAJE TELEGRAM: APROBADOS vs NO APROBADOS (entrenamiento)
-# ====================================================================
-async def filtra_aprobados():
-    pairs = build_pairs_list()
-    cfg_mode = MODOS[MODE["current"]]
-
-    TRAIN_WR = 0.65
-    TRAIN_TRADES_MIN = 3
-
-    mayores_65 = []
-    menores_65 = []
-    aprobados_modo = []
-
-    txt_hi = f"📚 <b>ENTRENAMIENTO COMPLETO</b>\n\n" \
-             f"✅ Pares con WR ≥ {int(TRAIN_WR*100)}% (trades ≥ {TRAIN_TRADES_MIN}):\n"
-    txt_lo = f"📚 <b>ENTRENAMIENTO COMPLETO</b>\n\n" \
-             f"⚠️ Pares con WR < {int(TRAIN_WR*100)}% o trades < {TRAIN_TRADES_MIN}:\n"
-
-    for sym in pairs:
-        res = backtest_pare(sym)
-        wr = res["wr"]
-        tr = res["trades"]
-
-        if wr >= TRAIN_WR and tr >= TRAIN_TRADES_MIN:
-            mayores_65.append(sym)
-            txt_hi += f"• {sym} – {wr:.0%} ({tr} trades)\n"
-        else:
-            menores_65.append(sym)
-            txt_lo += f"• {sym} – {wr:.0%} ({tr} trades)\n"
-
-        if wr >= cfg_mode["wr"] and tr >= cfg_mode["trades"]:
-            aprobados_modo.append(sym)
-
-    if mayores_65:
-        await send_tg(txt_hi)
-    if menores_65:
-        await send_tg(txt_lo)
-
+async def _startup_notice():
+    modes_exec = ", ".join([CONFIG["MODES"][m]["EXECUTION"] for m in CONFIG["ACTIVE_MODES"]])
     await send_tg(
-        f"💎 Aprobados para modo <b>{MODE['current'].upper()}</b>: "
-        f"<b>{len(aprobados_modo)}</b> / {len(pairs)} pares\n"
-        f"(WR mín {cfg_mode['wr']:.0%}, trades mín {cfg_mode['trades']})"
+        f"✅ <b>{PROJECT_NAME}</b> iniciado\n"
+        f"🧭 Modo: <b>{MODE['current'].upper()}</b>\n"
+        f"🔎 Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
+        f"⏱️ Escaneo cada <b>{RUN_EVERY_SEC//60} min</b>\n"
+        f"🧩 Marcos: 4h / 1h → 15m → {modes_exec}"
     )
 
-    return aprobados_modo
+def can_send(pair, direction):
+    key = (pair, direction)
+    t = STATE["last_sent"].get(key, 0)
+    # antispam 30 min
+    return (time.time() - t) > (30*60)
 
-# ====================================================================
-# ANÁLISIS EN VIVO – Estrategia “semi-monstruosa”
-# ====================================================================
-APROBADOS = []
+def mark_sent(pair, direction):
+    STATE["last_sent"][(pair, direction)] = time.time()
 
-def analiza_vivo(symbol: str):
-    # ---------- Timeframe 5m (ejecución) ----------
-    df5 = load_or_download(symbol, "5m")
-    if len(df5) < 120:
+def fmt_price(x):
+    try:
+        return f"{x:.6f}" if x < 1 else (f"{x:.4f}" if x < 100 else f"{x:.2f}")
+    except:
+        return str(x)
+
+# =========================
+# Formato de alerta de señal
+# =========================
+def build_alert(symbol, side, price, sl, tp1, tp2, zona_valor, confirmacion, mode_cfg, notes):
+    if side == "LONG":
+        direccion = "🟢 LONG 📈"
+    else:
+        direccion = "🔴 SHORT 📉"
+
+    return (
+        f"✨ <b>SEÑAL DE TRADING</b> ✨\n\n"
+        f"💰 <b>ACTIVO:</b> {symbol}\n"
+        f"📉 <b>TEMPORALIDAD:</b> {mode_cfg['CONFIRM']} / {mode_cfg['CONFIRM2']}\n"
+        f"📍 <b>ZONA DE VALOR:</b> {zona_valor}\n"
+        f"🔄 <b>CONFIRMACIÓN:</b> {confirmacion}\n"
+        f"➡️ <b>DIRECCIÓN:</b> {direccion}\n"
+        f"📊 <b>ENTRADA (Entry):</b> <code>{fmt_price(price)}</code>\n"
+        f"🛑 <b>STOP LOSS:</b> <code>{fmt_price(sl)}</code>\n"
+        f"🎯 <b>TP1:</b> <code>{fmt_price(tp1)}</code>\n"
+        f"🎯 <b>TP2:</b> <code>{fmt_price(tp2)}</code>\n"
+        f"🎯 <b>TP3:</b> <code>{fmt_price(tp2 + (tp2 - tp1))}</code>\n\n"
+        f"📝 <b>NOTAS:</b> {', '.join(notes)}\n\n"
+        f"⚠️ <b>Gestión:</b> mover SL a BE al alcanzar TP1. Opera bajo tu propio riesgo. 🍀"
+    )
+
+# =========================
+# EMA / RSI / ATR nativos
+# =========================
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    roll_up = gain.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = loss.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.fillna(50)
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    ema_f = CONFIG["EMA"]["fast"]
+    ema_s = CONFIG["EMA"]["slow"]
+    ema_l = CONFIG["EMA"]["long"]
+    ema_uf = CONFIG["EMA"]["ultra_fast"]
+
+    df[f"EMA_{ema_f}"]  = ema(df["close"], ema_f)
+    df[f"EMA_{ema_s}"]  = ema(df["close"], ema_s)
+    df[f"EMA_{ema_l}"]  = ema(df["close"], ema_l)
+    df[f"EMA_{ema_uf}"] = ema(df["close"], ema_uf)
+
+    df["RSI"] = rsi(df["close"], CONFIG["RSI"]["period"])
+
+    tr = pd.concat([
+        (df["high"] - df["low"]),
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+
+    return df.dropna()
+
+# =========================
+# Patrones / Fibo / Bias
+# =========================
+def fetch_ohlcv_first_ok(symbol, timeframe, limit=500):
+    for _, ex in EX_OBJS.items():
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if data and len(data) >= 50:
+                df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+                # ignorar vela actual en formación
+                df = df.iloc[:-1].copy()
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+                df.set_index("ts", inplace=True)
+                return df
+        except Exception as e:
+            continue
+    return pd.DataFrame()
+
+def choch_bos_df(df, bias_hint=0):
+    if len(df) < 40:
+        return {"BOS_up":False,"BOS_down":False,"CHoCH_up":False,"CHoCH_down":False}
+    highs = df["high"].tail(40)
+    lows  = df["low"].tail(40)
+    prev_hi = highs.iloc[:-1].max()
+    prev_lo = lows.iloc[:-1].min()
+    last = df["close"].iloc[-1]
+    BOS_up = last > prev_hi
+    BOS_down = last < prev_lo
+    CHoCH_up = (bias_hint <= 0) and BOS_up
+    CHoCH_down = (bias_hint >= 0) and BOS_down
+    return {"BOS_up":BOS_up,"BOS_down":BOS_down,"CHoCH_up":CHoCH_up,"CHoCH_down":CHoCH_down}
+
+def find_fvg_df(df, max_scan=60):
+    if len(df) < 3:
         return None
-    if not has_min_daily_range(df5, min_pct=0.015):
+    hi = df["high"].values
+    lo = df["low"].values
+    for i in range(len(df) - 1, max(1, len(df) - max_scan), -1):
+        if i-2 < 0:
+            break
+        if lo[i] > hi[i-2]:
+            return {"type":"bull","gap":(hi[i-2], lo[i])}
+        if hi[i] < lo[i-2]:
+            return {"type":"bear","gap":(hi[i], lo[i-2])}
+    return None
+
+def bullish_engulfing(df):
+    if len(df) < 2:
+        return False
+    o1,c1,l1,h1 = df["open"].iloc[-2], df["close"].iloc[-2], df["low"].iloc[-2], df["high"].iloc[-2]
+    o2,c2,l2,h2 = df["open"].iloc[-1], df["close"].iloc[-1], df["low"].iloc[-1], df["high"].iloc[-1]
+    return (c2>o2) and (c1<o1) and (o2<=c1) and (c2>=o1) and (h2>=h1) and (l2<=l1)
+
+def bearish_engulfing(df):
+    if len(df) < 2:
+        return False
+    o1,c1,l1,h1 = df["open"].iloc[-2], df["close"].iloc[-2], df["low"].iloc[-2], df["high"].iloc[-2]
+    o2,c2,l2,h2 = df["open"].iloc[-1], df["close"].iloc[-1], df["low"].iloc[-1], df["high"].iloc[-1]
+    return (c2<o2) and (c1>o1) and (o2>=c1) and (c2<=o1) and (h2>=h1) and (l2<=l1)
+
+def double_top_bottom(df, bars=40, tol=0.004):
+    seg = df.tail(bars)
+    hi_vals = seg["high"]
+    lo_vals = seg["low"]
+    max1 = hi_vals.max()
+    min1 = lo_vals.min()
+    last_half_hi = hi_vals.tail(bars//2).max()
+    last_half_lo = lo_vals.tail(bars//2).min()
+    two_top = abs(last_half_hi - max1)/max(max1,1e-9) <= tol
+    two_bot = abs(last_half_lo - min1)/max(min1,1e-9) <= tol
+    return two_top, two_bot, max1, min1
+
+def flag_triangle(df, bars=30, slope_tol=0.0):
+    seg = df.tail(bars).copy()
+    highs = seg["high"].values
+    lows  = seg["low"].values
+    dec_hi = all(highs[i] <= highs[i-1] + slope_tol for i in range(1,len(highs)))
+    inc_lo = all(lows[i]  >= lows[i-1]  - slope_tol for i in range(1,len(lows)))
+    if dec_hi and inc_lo:
+        last_close = seg["close"].iloc[-1]
+        broke_up   = last_close > max(highs[:-1])
+        broke_down = last_close < min(lows[:-1])
+        return True, broke_up, broke_down
+    return False, False, False
+
+def fib_levels(lo, hi, is_long=True):
+    base = (hi - lo) if is_long else (lo - hi)
+    if base <= 0:
+        return {"ret":{}, "ext":{}}
+    if is_long:
+        rets = {r: hi - base*r for r in FIB_RET}
+        exts = {r: hi + base*r for r in FIB_EXT}
+    else:
+        rets = {r: lo + base*r for r in FIB_RET}
+        exts = {r: lo - base*r for r in FIB_EXT}
+    return {"ret":rets, "ext":exts}
+
+def fib_time_windows(a_idx, b_idx, levels=None):
+    if levels is None:
+        levels = FIB_TIME_LEVELS
+    dur = abs(int(b_idx) - int(a_idx))
+    if dur <= 0:
+        return []
+    windows = [int(round(b_idx + L * dur)) for L in levels]
+    return sorted(list(set(windows)))
+
+def find_valid_block(df, is_long, bars=50):
+    if len(df) < bars:
         return None
-    df5 = compute_indicators(df5)
-    if len(df5) < 40:
+    df_scan = df.tail(bars).iloc[:-1]
+    for i in range(len(df_scan)-1, 0, -1):
+        c, o = df_scan["close"].iloc[i], df_scan["open"].iloc[i]
+        if is_long:
+            if c > o:
+                ob_candle = df_scan.iloc[i-1]
+                if ob_candle["close"] < ob_candle["open"]:
+                    return {"type":"OB_bull","level":ob_candle["open"]}
+        else:
+            if c < o:
+                ob_candle = df_scan.iloc[i-1]
+                if ob_candle["close"] > ob_candle["open"]:
+                    return {"type":"OB_bear","level":ob_candle["open"]}
+    return None
+
+def idx_near_any(now_idx, windows, tol=TIME_TOL_BARS):
+    return any(abs(now_idx - w) <= tol for w in windows)
+
+def trend_sign_from_emas(df):
+    ema_f = CONFIG["EMA"]["fast"]
+    ema_s = CONFIG["EMA"]["slow"]
+    ema_l = CONFIG["EMA"]["long"]
+    if len(df) < 60:
+        return 0
+    c = df["close"].iloc[-1]
+    emaf = df[f"EMA_{ema_f}"].iloc[-1]
+    emas = df[f"EMA_{ema_s}"].iloc[-1]
+    emal = df[f"EMA_{ema_l}"].iloc[-1]
+    emas_prev = df[f"EMA_{ema_s}"].iloc[-5]
+    up = (c > emal) and (emaf > emas) and (df[f"EMA_{ema_s}"].iloc[-1] > emas_prev)
+    dn = (c < emal) and (emaf < emas) and (df[f"EMA_{ema_s}"].iloc[-1] < emas_prev)
+    return 1 if up else (-1 if dn else 0)
+
+def premium_discount_zone(price, swing_low, swing_high):
+    if swing_high <= swing_low:
+        return "eq", (swing_high + swing_low)/2.0
+    rango = swing_high - swing_low
+    limite_discount = swing_low + rango*0.2
+    limite_premium  = swing_high - rango*0.2
+    if price < limite_discount:
+        return "discount", (swing_high + swing_low)/2.0
+    if price > limite_premium:
+        return "premium", (swing_high + swing_low)/2.0
+    return "eq", (swing_high + swing_low)/2.0
+
+def sl_tp(price, is_long, sw5_lo, sw5_hi, sw15_lo, sw15_hi, atr_val, fvg=None, exts_15=None, exts_1h=None):
+    base = max(1e-9, (sw15_hi - sw15_lo) if is_long else (sw15_lo - sw15_hi))
+    inv_786_long  = sw15_hi - base*0.786
+    inv_786_short = sw15_lo + base*0.786
+    if is_long:
+        sl = min(sw5_lo, inv_786_long, price - ATR_MULT*atr_val)
+        cands = []
+        if fvg and fvg.get("type")=="bull":
+            cands.append(fvg["gap"][1])
+        if exts_15:
+            for r in [0.618,0.75,1.0,1.272,1.414,1.618]:
+                if r in exts_15:
+                    cands.append(exts_15[r])
+        if exts_1h:
+            for r in [0.618,0.75,1.0,1.272,1.414,1.618]:
+                if r in exts_1h:
+                    cands.append(exts_1h[r])
+        cands = sorted({x for x in cands if x and x>price})
+        tp1 = cands[0] if cands else price + max(atr_val*1.2, price*0.003)
+        tp2 = cands[1] if len(cands)>1 else price + max(atr_val*2.0, price*0.006)
+    else:
+        sl = max(sw5_hi, inv_786_short, price + ATR_MULT*atr_val)
+        cands = []
+        if fvg and fvg.get("type")=="bear":
+            cands.append(fvg["gap"][0])
+        if exts_15:
+            for r in [0.618,0.75,1.0,1.272,1.414,1.618]:
+                if r in exts_15:
+                    cands.append(exts_15[r])
+        if exts_1h:
+            for r in [0.618,0.75,1.0,1.272,1.414,1.618]:
+                if r in exts_1h:
+                    cands.append(exts_1h[r])
+        cands = sorted({x for x in cands if x and x<price}, reverse=True)
+        tp1 = cands[0] if cands else price - max(atr_val*1.2, price*0.003)
+        tp2 = cands[1] if len(cands)>1 else price - max(atr_val*2.0, price*0.006)
+    return float(tp1), float(tp2), float(sl)
+
+# =========================
+# Núcleo de análisis por símbolo
+# =========================
+def analyze_symbol(symbol, mode_cfg):
+    df4  = fetch_ohlcv_first_ok(symbol, mode_cfg["MACRO"],    limit=300)
+    df1  = fetch_ohlcv_first_ok(symbol, mode_cfg["CONFIRM"],  limit=300)
+    df15 = fetch_ohlcv_first_ok(symbol, mode_cfg["CONFIRM2"], limit=300)
+    dfE  = fetch_ohlcv_first_ok(symbol, mode_cfg["EXECUTION"],limit=300)
+    if df4.empty or df1.empty or df15.empty or dfE.empty:
         return None
 
-    # ---------- Timeframe 1h (tendencia obligatoria) ----------
-    df1h = load_or_download(symbol, "1h")
-    if len(df1h) < 80:
-        return None
-    df1h = compute_indicators(df1h)
-    last1h = df1h.tail(1)
-    c1h     = last1h["close"][0]
-    ema12_1h= last1h["EMA_12"][0]
-    ema50_1h= last1h["EMA_50"][0]
-    ema200_1h=last1h["EMA_200"][0]
-    rsi1h   = last1h["RSI"][0]
+    df4  = compute_indicators(df4)
+    df1  = compute_indicators(df1)
+    df15 = compute_indicators(df15)
+    dfE  = compute_indicators(dfE)
 
-    # ---------- Timeframe 4h (bias macro EMA100) ----------
-    df4h = load_or_download(symbol, "4h")
-    if len(df4h) < 40:
-        return None
-    df4h = df4h.with_columns(
-        EMA_100=pl.col("close").ewm_mean(span=100)
-    ).drop_nulls()
-    last4h = df4h.tail(1)
-    c4h    = last4h["close"][0]
-    ema100_4h = last4h["EMA_100"][0]
+    # ===== 1) Swing 4h (EMA_100 / EMA_50) =====
+    # Usamos EMA_50 como proxy de 100 si quieres, o puedes añadir explícita
+    ema4_50 = ema(df4["close"], 50)
+    df4["EMA_50_SWING"] = ema4_50
+    price_4h = df4["close"].iloc[-1]
+    swing_bias = 1 if price_4h > df4["EMA_50_SWING"].iloc[-1] else -1
 
-    # ---------- Última vela 5m ----------
-    last = df5.tail(1)
-    c     = last["close"][0]
-    ema12 = last["EMA_12"][0]
-    ema50 = last["EMA_50"][0]
-    ema200= last["EMA_200"][0]
-    rsi   = last["RSI"][0]
-    vol   = last["volume"][0]
-    hi    = last["high"][0]
-    lo    = last["low"][0]
-
-    if any(pl.is_nan(x) for x in [c, ema12, ema50, ema200, rsi, vol, hi, lo]):
+    # ===== 2) Macro 1h (12/50/200) =====
+    t1 = trend_sign_from_emas(df1)
+    if t1 == 1:
+        macro_bias = 1
+    elif t1 == -1:
+        macro_bias = -1
+    else:
         return None
 
-    # Filtro de volumen relativo (últimas 20 velas sin la actual)
-    if len(df5) >= 21:
-        vwin = df5.tail(21)
-        v_mean = vwin["volume"][:-1].mean()
-        if v_mean is not None and v_mean > 0 and vol < 1.5 * float(v_mean):
+    # combinamos: si difieren demasiado, descartamos
+    if swing_bias != macro_bias:
+        return None
+
+    is_long = (macro_bias == 1)
+    bias_str = "LONG" if is_long else "SHORT"
+
+    notes = [f"4h bias: {'LONG' if swing_bias==1 else 'SHORT'}",
+             f"1h bias ok ({'LONG' if macro_bias==1 else 'SHORT'})",
+             f"Modo: {MODE['current'].upper()}"]
+
+    # ===== 3) Confirmación 15m (pullback + Fibo + EMA50 + RSI) =====
+    last15 = df15.iloc[-1]
+    c15    = float(last15["close"])
+    sw15_lo = df15["low"].tail(80).min()
+    sw15_hi = df15["high"].tail(80).max()
+    fib15  = fib_levels(sw15_lo, sw15_hi, is_long=is_long)
+    rets15 = [fib15["ret"].get(r) for r in [0.5, 0.618, 0.65, 0.75]]  # golden zone extendida
+
+    mode = MODE["current"]
+    if mode == "suave":
+        tol_pull = RELAX["RET_TOL_SUAVE"]
+        eps_ema  = RELAX["EMA_SOFT_EPS_SUAVE"]
+        rsi_long_lo, rsi_long_hi = RELAX["RSI_LONG_SUAVE"]
+        rsi_short_lo, rsi_short_hi = RELAX["RSI_SHORT_SUAVE"]
+    elif mode == "normal":
+        tol_pull = RELAX["RET_TOL_NORMAL"]
+        eps_ema  = RELAX["EMA_SOFT_EPS_NORMAL"]
+        rsi_long_lo, rsi_long_hi = RELAX["RSI_LONG_NORMAL"]
+        rsi_short_lo, rsi_short_hi = RELAX["RSI_SHORT_NORMAL"]
+    else:  # sniper
+        tol_pull = RET_TOL
+        eps_ema  = 0.0005
+        rsi_long_lo, rsi_long_hi = (42, 68)
+        rsi_short_lo, rsi_short_hi = (32, 58)
+
+    def _near(vals, price, tol):
+        vals = [v for v in vals if v is not None]
+        return any(abs(price - v)/max(v,1e-9) <= tol for v in vals)
+
+    near_ret15 = _near(rets15, c15, tol_pull)
+
+    if is_long:
+        cond_ema = (c15 > last15["EMA_200"]*(1 - eps_ema)) and (last15["EMA_15"] > last15["EMA_50"]*(1 - eps_ema))
+        cond_rsi = (rsi_long_lo <= last15["RSI"] <= rsi_long_hi)
+        if not (near_ret15 and cond_ema and cond_rsi):
+            return None
+    else:
+        cond_ema = (c15 < last15["EMA_200"]*(1 + eps_ema)) and (last15["EMA_15"] < last15["EMA_50"]*(1 + eps_ema))
+        cond_rsi = (rsi_short_lo <= last15["RSI"] <= rsi_short_hi)
+        if not (near_ret15 and cond_ema and cond_rsi):
             return None
 
-    # ---------- Score y dirección básica 5m ----------
-    score = 0
-    is_long = None
+    notes.append("Pullback 15m en zona Fibo 0.5–0.75")
 
-    # Condición base (como en backtest) – 5m
-    if c > ema200*0.998 and ema12 > ema50*0.998 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
-        is_long = True
-        score += 2
-    elif c < ema200*1.002 and ema12 < ema50*1.002 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
-        is_long = False
-        score += 2
+    # Liquidez + Order Block
+    sw_prev_lo = df15["low"].iloc[:-80].min()
+    sw_prev_hi = df15["high"].iloc[:-80].max()
+    liquidity_taken = False
+    if is_long:
+        liquidity_taken = sw15_lo < sw_prev_lo * (1 - 0.001)
+        if liquidity_taken:
+            notes.append("Sell-side liquidez tomada")
+    else:
+        liquidity_taken = sw15_hi > sw_prev_hi * (1 + 0.001)
+        if liquidity_taken:
+            notes.append("Buy-side liquidez tomada")
 
-    if is_long is None:
+    if mode == "sniper" and not liquidity_taken:
+        notes.append("⚠️ Falta sweep de liquidez")
         return None
 
-    # Rango diario ya filtrado → +1
-    score += 1
+    block15 = find_valid_block(df15, is_long, bars=50)
+    near_block = False
+    if block15:
+        near_block = _near([block15["level"]], c15, tol_pull)
+        if near_block:
+            notes.append(f"{block15['type']} cerca")
 
-    # RSI más fino (zona media) → +1
-    if 40 <= rsi <= 60:
-        score += 1
-
-    # ---------- Bias macro 4h (EMA100) ----------
-    bias_4h_long = c4h > ema100_4h
-    bias_4h_short= c4h < ema100_4h
-
-    if is_long and not bias_4h_long:
-        return None
-    if not is_long and not bias_4h_short:
+    if mode == "sniper" and not near_block:
+        notes.append("⚠️ Falta Order Block")
         return None
 
-    score += 1  # confluencia con bias 4h
+    # ===== 4) Gatillo 5m/15m (hook EMA50 + RSI + patrones) =====
+    def trigger_exec(df_exec, is_long, mode):
+        df_exec = compute_indicators(df_exec.copy())
+        if len(df_exec) < 20:
+            return False, {}
+        last = df_exec.iloc[-1]
+        eps_local = eps_ema  # reusar
 
-    # ---------- Tendencia 1h (EMA 12/50/200) ----------
-    trend_1h_bull = (ema12_1h > ema50_1h > ema200_1h) and rsi1h >= 40
-    trend_1h_bear = (ema12_1h < ema50_1h < ema200_1h) and rsi1h <= 60
+        ema_uf_val = last["EMA_12"]
+        ema50_val  = last["EMA_50"]
+        ema200_val = last["EMA_200"]
+        rsi_val    = last["RSI"]
+        close_val  = last["close"]
 
-    if is_long and not trend_1h_bull:
+        # hook: precio regresando a EMA50 y girando RSI
+        hook = abs(close_val - ema50_val)/max(ema50_val,1e-9) <= tol_pull
+
+        # estructura
+        struct = choch_bos_df(df_exec, bias_hint=(1 if is_long else -1))
+        fvg    = find_fvg_df(df_exec, max_scan=50)
+
+        if is_long:
+            cond = (
+                close_val > ema200_val*(1 - eps_local) and
+                ema_uf_val > ema50_val*(1 - eps_local) and
+                rsi_val > 50 and
+                (struct["BOS_up"] or struct["CHoCH_up"]) and
+                hook
+            )
+            if mode == "sniper":
+                cond = cond and (not fvg or fvg["type"]=="bull")
+        else:
+            cond = (
+                close_val < ema200_val*(1 + eps_local) and
+                ema_uf_val < ema50_val*(1 + eps_local) and
+                rsi_val < 50 and
+                (struct["BOS_down"] or struct["CHoCH_down"]) and
+                hook
+            )
+            if mode == "sniper":
+                cond = cond and (not fvg or fvg["type"]=="bear")
+
+        return cond, {"struct":struct, "fvg":fvg, "price":float(close_val), "atr":float(last["ATR"])}
+
+    if mode_cfg["EXECUTION"] == "5m":
+        ok_exec, extra = trigger_exec(dfE, is_long, mode)
+    else:
+        ok_exec, extra = trigger_exec(df15, is_long, mode)
+
+    if not ok_exec:
         return None
-    if not is_long and not trend_1h_bear:
+
+    # patrones extra en exec
+    if mode_cfg["EXECUTION"] == "5m":
+        df_pat = dfE
+    else:
+        df_pat = df15
+
+    bull_eng = bullish_engulfing(df_pat)
+    bear_eng = bearish_engulfing(df_pat)
+    two_top, two_bot, _, _ = double_top_bottom(df_pat, bars=40, tol=0.004)
+    tri_ok, broke_up, broke_dn = flag_triangle(df_pat, bars=30)
+
+    if is_long:
+        patt_ok = bull_eng or two_bot or (tri_ok and broke_up)
+    else:
+        patt_ok = bear_eng or two_top or (tri_ok and broke_dn)
+
+    if mode == "sniper" and not patt_ok:
+        notes.append("⚠️ Falta patrón fuerte en gatillo")
         return None
+    elif patt_ok:
+        notes.append("Patrón gatillo OK")
 
-    score += 1  # confluencia con 1h
+    # ===== premium / discount en 15m =====
+    zone15, eq15 = premium_discount_zone(c15, sw15_lo, sw15_hi)
+    if is_long:
+        if zone15 == "premium":
+            notes.append("⚠️ Long en zona premium (descartado)")
+            return None
+        if zone15 == "eq":
+            notes.append("Zona Eq (cuidado)")
+    else:
+        if zone15 == "discount":
+            notes.append("⚠️ Short en zona discount (descartado)")
+            return None
+        if zone15 == "eq":
+            notes.append("Zona Eq (cuidado)")
 
-    # ---------- Swings + BOS/CHoCH en 5m ----------
-    df_sw = detect_swings(df5.tail(200), lookback=2)
-    bos_dir = get_bos_direction(df_sw)
-    if bos_dir == "bull" and is_long:
-        score += 1
-    elif bos_dir == "bear" and not is_long:
-        score += 1
+    zona_valor_reporte = zone15.upper()
 
-    # ---------- FVG reciente alineado ----------
-    fvg = detect_recent_fvg(df5.tail(120))
-    if fvg is not None:
-        side_fvg = fvg["side"]
-        mid_fvg  = fvg["mid"]
-        dist = abs(c - mid_fvg) / max(c, 1e-9)
-        if dist <= 0.008:  # precio cerca del centro del FVG (0.8 %)
-            if side_fvg == "LONG" and is_long:
-                score += 1
-            elif side_fvg == "SHORT" and not is_long:
-                score += 1
+    # ===== SL / TPs =====
+    if mode_cfg["EXECUTION"] == "5m":
+        sw5_lo = dfE["low"].tail(60).min()
+        sw5_hi = dfE["high"].tail(60).max()
+    else:
+        sw5_lo = df15["low"].tail(60).min()
+        sw5_hi = df15["high"].tail(60).max()
 
-    # ---------- Validar score por modo ----------
-    mode = MODE["current"]
-    if score < SCORE_MIN.get(mode, 4):
+    price_exec = extra.get("price", float(dfE["close"].iloc[-1]))
+    atr_exec   = extra.get("atr", float(dfE["ATR"].iloc[-1]))
+
+    sw1_lo = df1["low"].tail(120).min()
+    sw1_hi = df1["high"].tail(120).max()
+    fib_ext_15 = fib_levels(sw15_lo, sw15_hi, is_long=is_long)["ext"]
+    fib_ext_1h = fib_levels(sw1_lo,  sw1_hi,  is_long=is_long)["ext"]
+
+    tp1, tp2, sl = sl_tp(
+        price_exec, is_long,
+        sw5_lo, sw5_hi,
+        sw15_lo, sw15_hi,
+        atr_exec,
+        fvg=extra.get("fvg"),
+        exts_15=fib_ext_15,
+        exts_1h=fib_ext_1h
+    )
+
+    # ===== RR =====
+    risk = abs(price_exec - sl)
+    reward1 = abs(tp1 - price_exec)
+    if risk <= 1e-9:
         return None
+    rr1 = reward1 / risk
 
-    # ---------- SL/TP basados en rango actual ----------
-    atr_like = hi - lo
-    if pl.is_nan(atr_like) or atr_like <= 0:
-        return None
+    rr_min = MIN_RR
+    if mode == "suave":
+        rr_min = 1.2
+    elif mode == "normal":
+        rr_min = 1.6
+    else:
+        rr_min = MIN_RR
 
-    sl  = c - atr_like*1.8 if is_long else c + atr_like*1.8
-    tp1 = c + atr_like*1.8*1.5 if is_long else c - atr_like*1.8*1.5
-    tp2 = c + atr_like*1.8*2.5 if is_long else c - atr_like*1.8*2.5
+    if rr1 < rr_min:
+        notes.append(f"⚠️ RR {rr1:.2f} (baja)")
+        if mode == "sniper":
+            return None
+    else:
+        notes.append(f"RR {rr1:.2f} (ok)")
 
-    rr  = abs(tp1 - c) / max(abs(c - sl), 1e-9)
-    if rr < 1.6:
-        return None
+    # FVG y estructura a notas
+    st = extra.get("struct", {})
+    fvg = extra.get("fvg")
+    if fvg:
+        notes.append(f"FVG {fvg['type']}")
+    if st.get("BOS_up"):
+        notes.append("BOS↑")
+    if st.get("BOS_down"):
+        notes.append("BOS↓")
+    if st.get("CHoCH_up"):
+        notes.append("CHoCH↑")
+    if st.get("CHoCH_down"):
+        notes.append("CHoCH↓")
+
+    # doble techo/suelo en 15m para confirmación
+    two_top_15, two_bot_15, _, _ = double_top_bottom(df15, bars=40, tol=0.004)
+    patrones_detectados = []
+    if is_long:
+        if two_bot_15:
+            patrones_detectados.append("15m")
+        confirmacion_msg = f"Doble Suelo en {', '.join(patrones_detectados)}." if patrones_detectados else "Sin patrón fuerte visible."
+    else:
+        if two_top_15:
+            patrones_detectados.append("15m")
+        confirmacion_msg = f"Doble Techo en {', '.join(patrones_detectados)}." if patrones_detectados else "Sin patrón fuerte visible."
 
     side = "LONG" if is_long else "SHORT"
 
-    # Convertir score a estrellas máx 5
-    stars = min(score, 7)
-    star_5 = min(5, max(1, stars - 2))  # mapear 3–7 → 1–5
-
     return {
         "side": side,
-        "price": float(c),
-        "sl": float(sl),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "rr": float(rr),
-        "score": int(star_5)
+        "price": price_exec,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "notes": notes,
+        "zona_valor": zona_valor_reporte,
+        "confirmacion": confirmacion_msg
     }
 
-# ====================================================================
-# ALERTA / REGISTRO
-# ====================================================================
-def fmt_price(x):
-   
+# =========================
+# Registro de señales + Gmail adjuntos
+# =========================
+DAILY_SIGNALS = []
+
+def register_signal(d: dict):
+    x = dict(d)
+    x["ts"] = datetime.now(UTC).isoformat()
+    DAILY_SIGNALS.append(x)
+
+def send_email_with_attachments(subject: str, body: str, attachments: list):
+    if not (SMTP_EMAIL and SMTP_APP_PASSWORD and SMTP_TO):
+        print("⚠️ SMTP no configurado; salto envío.")
+        return
+    msg = EmailMessage()
+    msg["From"] = SMTP_EMAIL
+    msg["To"]   = SMTP_TO
+    msg["Subject"] = subject
+    msg.set_content(body)
+    for filename, file_bytes, mime in attachments:
+        maintype, subtype = mime.split("/")
+        msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=filename)
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
+        s.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+        s.send_message(msg)
+
+async def email_daily_signals_excel():
+    if not DAILY_SIGNALS:
+        print("ℹ️ No hay señales para el Excel diario.")
+        return
+    df = pd.DataFrame(DAILY_SIGNALS)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="signals")
+    buf.seek(0)
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    send_email_with_attachments(
+        f"[{PROJECT_NAME}] Señales {day}",
+        f"Adjunto Excel con señales del {day} (UTC).",
+        [(f"signals_{day}.xlsx", buf.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")]
+    )
+    print("📧 Excel diario enviado.")
+    DAILY_SIGNALS.clear()
+
+async def collect_candles_and_email():
+    rows = []
+    pairs = ACTIVE_PAIRS
+    tfs   = TIMEFRAMES
+    max_pairs = min(len(pairs), 20)
+    for sym in pairs[:max_pairs]:
+        for tf in tfs[:2]:
+            df = fetch_ohlcv_first_ok(sym, tf, limit=120)
+            if df.empty:
+                continue
+            last = df.tail(1).reset_index()
+            last["symbol"] = sym
+            last["tf"] = tf
+            rows.append(last)
+    if not rows:
+        return
+    out = pd.concat(rows, ignore_index=True).rename(columns={"ts":"time"})
+    csv_bytes = out.to_csv(index=False).encode("utf-8")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d_%H%M")
+    send_email_with_attachments(
+        f"[{PROJECT_NAME}] Velas {stamp}",
+        f"Adjunto CSV de última vela por símbolo/TF ({stamp} UTC).",
+        [(f"candles_{stamp}.csv", csv_bytes, "text/csv")]
+    )
+    print("📧 CSV de velas enviado.")
+
+# =========================
+# Comandos Telegram
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MONITOR_ACTIVE
+    MONITOR_ACTIVE = True
+    modes_exec = ", ".join([CONFIG["MODES"][m]["EXECUTION"] for m in CONFIG["ACTIVE_MODES"]])
+    await send_tg(
+        f"✅ Bot ACTIVADO\n"
+        f"🧭 Modo: <b>{MODE['current'].upper()}</b>\n"
+        f"🔎 Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
+        f"⏱️ {RUN_EVERY_SEC//60} min\n"
+        f"Ejecuciones: {modes_exec}"
+    )
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MONITOR_ACTIVE
+    MONITOR_ACTIVE = False
+    await send_tg("🛑 Bot DETENIDO.")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    modes_exec = ", ".join([CONFIG["MODES"][m]["EXECUTION"] for m in CONFIG["ACTIVE_MODES"]])
+    await send_tg(
+        f"📊 <b>ESTADO</b>\n"
+        f"• Pares: <b>{len(ACTIVE_PAIRS)}</b>\n"
+        f"• Modos exec: <b>{modes_exec}</b>\n"
+        f"• Modo actual: <b>{MODE['current'].upper()}</b>\n"
+        f"• Monitoreo: <b>{'ACTIVO' if MONITOR_ACTIVE else 'DETENIDO'}</b>"
+    )
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip().lower().split()
+    if len(txt) >= 2 and txt[1] in ("suave","normal","sniper"):
+        MODE["current"] = txt[1]
+        await send_tg(f"⚙️ Modo cambiado a <b>{MODE['current'].upper()}</b>.")
+    else:
+        await send_tg("Usa: <code>/mode suave</code>, <code>/mode normal</code> o <code>/mode sniper</code>")
+
+async def cmd_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_tg("⏳ Generando y enviando Excel de señales del día…")
+    try:
+        await email_daily_signals_excel()
+        await send_tg("✅ Excel enviado (si había señales). Revisa tu correo.")
+    except Exception as e:
+        await send_tg(f"❌ Error enviando Excel: {e}")
+
+# =========================
+# Bucles principales
+# =========================
+async def monitor_loop():
+    await _startup_notice()
+    while True:
+        if not MONITOR_ACTIVE:
+            await asyncio.sleep(3)
+            continue
+        for mk in CONFIG["ACTIVE_MODES"]:
+            mode_cfg = CONFIG["MODES"][mk]
+            print(f"[{datetime.now(UTC).strftime('%H:%M:%S')}] Escaneando {mk} (EXEC {mode_cfg['EXECUTION']})…")
+            for sym in ACTIVE_PAIRS:
+                try:
+                    res = analyze_symbol(sym, mode_cfg)
+                    if not res:
+                        continue
+
+                    side = res["side"]
+                    price, sl, tp1, tp2 = res["price"], res["sl"], res["tp1"], res["tp2"]
+                    zona_valor, confirmacion = res["zona_valor"], res["confirmacion"]
+                    notes = res["notes"]
+
+                    if can_send(sym, side):
+                        msg = build_alert(sym, side, price, sl, tp1, tp2, zona_valor, confirmacion, mode_cfg, notes)
+                        await send_tg(msg)
+
+                        full_notes = f"{zona_valor}|{confirmacion}|" + "|".join(notes)
+                        register_signal({
+                            "symbol": sym,
+                            "side": side,
+                            "price": price,
+                            "sl": sl,
+                            "tp1": tp1,
+                            "tp2": tp2,
+                            "notes": full_notes,
+                            "mode": mk
+                        })
+                        mark_sent(sym, side)
+                except Exception as e:
+                    print(f"⚠️ Error analizando {sym}: {e}")
+        await asyncio.sleep(RUN_EVERY_SEC)
+
+async def scheduler_loop():
+    last_csv_min = -1
+    while True:
+        now = datetime.now(UTC)
+        # cada 30 min manda CSV de velas
+        if now.minute in (0,30) and last_csv_min != now.minute:
+            last_csv_min = now.minute
+            try:
+                await collect_candles_and_email()
+            except Exception as e:
+                print("collect_candles_and_email error:", e)
+
+        # Excel diario 23:59 UTC
+        if now.hour == 23 and now.minute == 59 and now.second < 5:
+            try:
+                await email_daily_signals_excel()
+            except Exception as e:
+                print("email_daily_signals_excel error:", e)
+            await asyncio.sleep(5)
+        await asyncio.sleep(1)
+
+# =========================
+# FastAPI keep-alive (/ping, /tv)
+# =========================
+app = FastAPI()
+
+@app.get("/ping")
+async def ping():
+    return {"ok": True, "service": PROJECT_NAME, "time": datetime.now(UTC).isoformat()}
+
+@app.post("/tv")
+async def tv_webhook(req: Request):
+    if not TV_SECRET:
+        return {"ok": False, "error": "TV_SECRET not set"}
+    data = await req.json()
+    if data.get("secret") != TV_SECRET:
+        return {"ok": False, "error": "bad secret"}
+    symbol = data.get("symbol")
+    price  = data.get("price")
+    tf     = data.get("tf") or data.get("interval")
+    ts     = data.get("time") or datetime.now(UTC).isoformat()
+    msg = f"📈 TV Signal\nSymbol: {symbol}\nTF: {tf}\nPrice: {price}\nTime: {ts}"
+    await send_tg(msg)
+    register_signal({"source":"tv","symbol":symbol,"price":price,"tf":tf,"time":ts})
+    return {"ok": True}
+
+def start_http():
+    def _run():
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT","8080")), log_level="warning")
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+
+# =========================
+# Telegram (run_polling en thread)
+# =========================
+def start_telegram_bot():
+    app_tg = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start",  cmd_start))
+    app_tg.add_handler(CommandHandler("stop",   cmd_stop))
+    app_tg.add_handler(CommandHandler("status", cmd_status))
+    app_tg.add_handler(CommandHandler("mode",   cmd_mode))
+    app_tg.add_handler(CommandHandler("excel",  cmd_excel))
+
+    def _run():
+        app_tg.run_polling()
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+
+# =========================
+# Entrypoint
+# =========================
+async def main_async():
+    start_http()
+    start_telegram_bot()
+    await asyncio.gather(
+        monitor_loop(),
+        scheduler_loop(),
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_async())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.create_task(main_async())
+        loop.run_forever()
