@@ -1,9 +1,10 @@
 # ======================================================================
 # Bot V4 – Render 24/7  (sin pandas, solo polars)
-# 1. Descarga velas 4h/1h/15m/5m (Bitunix)
+# 1. Descarga velas 4h/1h/15m/5m (multi-exchange)
 # 2. Back-test individual ≥ 65 % WR → lista blanca
-# 3. Escanía y manda SEÑALES (solo aprobados)
-# 4. No tradea automáticamente
+# 3. Manda lista por Telegram: aprobados vs no aprobados
+# 4. Escanía y manda SEÑALES (solo aprobados, formato original)
+# 5. No tradea automáticamente
 # ======================================================================
 
 import os, re, time, math, asyncio, threading, smtplib, ssl, io, pytz
@@ -25,7 +26,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 load_dotenv()
 
 # ---------- CONFIG ----------
-EXCHANGES           = ["bitunix"]
+EXCHANGES           = ["kucoin", "bybit", "okx", "binance"]   # ← fuente de datos
 MAX_PAIRS           = int(os.getenv("MAX_PAIRS", "150"))
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -46,19 +47,23 @@ STATE               = {"last_sent": {}, "daily_count": defaultdict(int), "last_r
 DAILY_SIGNALS       = []
 
 # ====================================================================
-# 1. EXCHANGE → solo Bitunix
+# 1. EXCHANGES → fuente de datos (puedes agregar más)
 # ====================================================================
-EX_OBJ = None
-def init_exchange():
-    global EX_OBJ
-    try:
-        ex = ccxt.bitunix({"enableRateLimit": True})
-        ex.load_markets()
-        EX_OBJ = ex
-        print(f"✅ Bitunix con {len(ex.symbols)} símbolos")
-    except Exception as e:
-        print("⚠️ No se pudo iniciar Bitunix:", e)
-init_exchange()
+EX_OBJS = {}
+def init_exchanges():
+    for name in EXCHANGES:
+        try:
+            klass = getattr(ccxt, name)
+            opts = {"enableRateLimit": True}
+            if name in ("bybit", "kucoin"):
+                opts["options"] = {"defaultType": "future"}
+            ex = klass(opts)
+            ex.load_markets()
+            EX_OBJS[name] = ex
+            print(f"✅ {name} con {len(ex.symbols)} símbolos")
+        except Exception as e:
+            print(f"⚠️ No se pudo iniciar {name}: {e}")
+init_exchanges()
 
 # ====================================================================
 # 2. UTILS / TELEGRAM
@@ -75,7 +80,7 @@ async def send_tg(text: str):
         print("❌ Telegram:", e)
 
 # ====================================================================
-# 3. DESCARGA DE VELAS
+# 3. DESCARGA DE VELAS (multi-exchange)
 # ====================================================================
 def csv_path(symbol, tf):
     return f"{DATA_DIR}/{tf}/{symbol.replace('/', '_')}_{tf}.csv"
@@ -85,17 +90,17 @@ def ensure_dirs():
         os.makedirs(f"{DATA_DIR}/{tf}", exist_ok=True)
 
 def download_once(symbol, tf, limit=1500):
-    if not EX_OBJ:
-        return pl.DataFrame()
-    try:
-        data = EX_OBJ.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-        df = pl.DataFrame(data, schema=["ts", "open", "high", "low", "close", "volume"])
-        df = df.with_columns(pl.col("ts").cast(pl.Int64))
-        df.write_csv(csv_path(symbol, tf))
-        return df
-    except Exception as e:
-        print(f"⚠️ download {symbol} {tf}: {e}")
-        return pl.DataFrame()
+    # intenta cada exchange hasta conseguir datos
+    for ex in EX_OBJS.values():
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+            df = pl.DataFrame(data, schema=["ts", "open", "high", "low", "close", "volume"])
+            df = df.with_columns(pl.col("ts").cast(pl.Int64))
+            df.write_csv(csv_path(symbol, tf))
+            return df
+        except Exception:
+            continue
+    return pl.DataFrame()
 
 def load_or_download(symbol, tf):
     path = csv_path(symbol, tf)
@@ -114,7 +119,7 @@ async def download_all_pares():
             total_rows += len(df)
     elapsed = time.time() - t0
     await send_tg(
-        f"📥 Descarga completa Bitunix\n"
+        f"📥 Descarga completa\n"
         f"🗂️  Pares: {len(pairs)}\n"
         f"📊 Filas: {total_rows/1e6:.1f} M\n"
         f"⏱️ Tiempo: {elapsed/60:.1f} min"
@@ -122,14 +127,32 @@ async def download_all_pares():
     return pairs
 
 # ====================================================================
-# 4. CONSTRUCCIÓN DE PARES (solo USDT Bitunix)
+# 4. CONSTRUCCIÓN DE PARES (solo USDT que existan en Bitunix)
 # ====================================================================
 def build_pairs_list():
-    if not EX_OBJ:
-        return []
-    syms = [s for s in EX_OBJ.symbols if s.endswith("/USDT")]
-    syms = [s for s in syms if not re.match(r"^(1000|1M|10K|B-|.*-).*?/USDT$", s)]
-    return sorted(syms)[:MAX_PAIRS]
+    # 1. obtiene lista de Bitunix
+    bitunix = EX_OBJS.get("bitunix")
+    if not bitunix:
+        bitunix = ccxt.bitunix({"enableRateLimit": True})
+        bitunix.load_markets()
+    bitunix_syms = {s for s in bitunix.symbols if s.endswith("/USDT")}
+
+    # 2. agrega de todos los exchanges sin repetir
+    agg, seen = [], set()
+    for ex in EX_OBJS.values():
+        try:
+            syms = [s for s in ex.symbols if s.endswith("/USDT") and s in bitunix_syms]
+            for s in syms:
+                if s not in seen:
+                    agg.append(s)
+                    seen.add(s)
+                if len(agg) >= MAX_PAIRS:
+                    break
+            if len(agg) >= MAX_PAIRS:
+                break
+        except Exception:
+            continue
+    return sorted(agg)[:MAX_PAIRS]
 
 # ====================================================================
 # 5. BACK-TEST INDIVIDUAL (con polars)
@@ -189,21 +212,33 @@ def backtest_pare(symbol):
     wr = (df_trades["R"] > 0).mean() if len(df_trades) else 0
     return {"trades": len(df_trades), "wr": wr, "df": df_trades}
 
+# ====================================================================
+# 6. MENSAJE TELEGRAM: APROBADOS vs NO APROBADOS
+# ====================================================================
 async def filtra_aprobados():
     pairs = build_pairs_list()
     aprobados = []
-    txt = "✅ Estrategia válida (≥65 % WR)\n\n"
+    txt_ok  = "✅ Estrategia válida (≥65 % WR)\n\n"
+    txt_ko  = "❌ NO aprobados (<65 % WR)\n\n"
+
     for sym in pairs:
         res = backtest_pare(sym)
         if res["wr"] >= WR_MINIMO and res["trades"] >= 10:
             aprobados.append(sym)
-            txt += f"• {sym}  –  {res['wr']:.0%} ({res['trades']} trades)\n"
-    txt += f"\n💎 Total: {len(aprobados)} pares\n"
-    await send_tg(txt)
+            txt_ok += f"• {sym}  –  {res['wr']:.0%} ({res['trades']} trades)\n"
+        else:
+            txt_ko += f"• {sym}  –  {res['wr']:.0%} ({res['trades']} trades)\n"
+
+    await send_tg(txt_ok)
+    if len(txt_ko.splitlines()) > 2:   # evita mensaje vacío
+        await send_tg(txt_ko)
+
+    await send_tg(f"💎 Total aprobados: {len(aprobados)} / {len(pairs)} pares\n"
+                  f"🎯 El bot escaneará SOLO los aprobados.")
     return aprobados
 
 # ====================================================================
-# 6. INDICADORES (en vivo) con polars
+# 7. INDICADORES (en vivo) con polars
 # ====================================================================
 def compute_indicators(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
@@ -221,7 +256,7 @@ def compute_indicators(df: pl.DataFrame) -> pl.DataFrame:
     return df.drop_nulls()
 
 # ====================================================================
-# 7. ANÁLISIS EN VIVO (solo pares aprobados) con polars
+# 8. ANÁLISIS EN VIVO (solo pares aprobados) con polars
 # ====================================================================
 APROBADOS = []
 
@@ -256,7 +291,7 @@ def analiza_vivo(symbol: str):
     return {"side": side, "price": float(c), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "rr": float(rr)}
 
 # ====================================================================
-# 8. ALERTA / REGISTRO
+# 9. ALERTA / REGISTRO  (TU FORMATO ORIGINAL)
 # ====================================================================
 def fmt_price(x):
     try:
@@ -267,15 +302,19 @@ def fmt_price(x):
 def build_alert(symbol, side, price, sl, tp1, tp2, rr):
     dir_emo = "🟢 LONG 📈" if side == "LONG" else "🔴 SHORT 📉"
     return (
-        f"✨ <b>SEÑAL {PROJECT_NAME}</b> ✨\n\n"
-        f"💰 <b>Par:</b> {symbol}\n"
-        f"➡️ <b>Dirección:</b> {dir_emo}\n"
-        f"📊 <b>Entry:</b> <code>{fmt_price(price)}</code>\n"
-        f"🛑 <b>SL:</b> <code>{fmt_price(sl)}</code>\n"
+        f"✨ <b>SEÑAL DE TRADING</b> ✨\n\n"
+        f"💰 <b>ACTIVO:</b> {symbol}\n"
+        f"📉 <b>TEMPORALIDAD:</b> 15m / 5m\n"
+        f"📍 <b>ZONA DE VALOR:</b> DISCOUNT\n"
+        f"🔄 <b>CONFIRMACIÓN:</b> Patrón + EMA + RSI\n"
+        f"➡️ <b>DIRECCIÓN:</b> {dir_emo}\n"
+        f"📊 <b>ENTRADA (Entry):</b> <code>{fmt_price(price)}</code>\n"
+        f"🛑 <b>STOP LOSS:</b> <code>{fmt_price(sl)}</code>\n"
         f"🎯 <b>TP1:</b> <code>{fmt_price(tp1)}</code>\n"
         f"🎯 <b>TP2:</b> <code>{fmt_price(tp2)}</code>\n"
+        f"🎯 <b>TP3:</b> <code>{fmt_price(tp2 + (tp2 - tp1))}</code>\n\n"
         f"📈 <b>RR:</b> {rr:.2f}\n\n"
-        f"⚠️ <b>Gestión:</b> mover SL a BE en TP1. Opera bajo tu riesgo."
+        f"⚠️ <b>Gestión:</b> mover SL a BE al alcanzar TP1. Opera bajo tu propio riesgo. 🍀"
     )
 
 DAILY_SIGNALS = []
@@ -285,12 +324,12 @@ def register_signal(d: dict):
     DAILY_SIGNALS.append(x)
 
 # ====================================================================
-# 9. LOOPS PRINCIPALES
+# 10. LOOPS PRINCIPALES
 # ====================================================================
 async def monitor_loop():
     # 1. descarga
     await download_all_pares()
-    # 2. back-test
+    # 2. back-test + mensajes
     global APROBADOS
     APROBADOS = await filtra_aprobados()
     if not APROBADOS:
@@ -327,7 +366,7 @@ async def monitor_loop():
         await asyncio.sleep(RUN_EVERY_SEC)
 
 # ====================================================================
-# 10. FASTAPI (keep-alive)
+# 11. FASTAPI (keep-alive)
 # ====================================================================
 app = FastAPI()
 @app.get("/ping")
@@ -339,7 +378,7 @@ def start_http():
     th.start()
 
 # ====================================================================
-# 11. ENTRYPOINT
+# 12. ENTRYPOINT
 # ====================================================================
 async def main_async():
     start_http()
