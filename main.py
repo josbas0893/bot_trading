@@ -1,6 +1,7 @@
 # =========================
-# Bot de Señales V2 — Replit / Render 24/7 (Mixto: Auto + Fallback Manual)
-# Sin pandas_ta (EMA/RSI/ATR calculados a mano)
+# Bot de Señales V2 — Replit / Render 24/7
+# Swing 4h + Macro 1h + Pullback 15m + Gatillo 5m
+# Con “entrenamiento” inicial y 6 mensajes de estado
 # =========================
 
 import os, re, time, math, asyncio, threading, smtplib, ssl, io
@@ -40,7 +41,7 @@ MAX_PAIRS_ENV  = int(os.getenv("MAX_PAIRS", "150"))
 TV_SECRET      = os.getenv("TV_SECRET", "")
 
 # =========================
-# Parámetros
+# Parámetros de estrategia
 # =========================
 FIB_RET = [0.382, 0.5, 0.618, 0.786]
 FIB_EXT = [0.618, 0.75, 1.0, 1.272, 1.414, 1.618, 2.0, 2.272, 2.618]
@@ -64,7 +65,7 @@ CONFIG = {
 }
 
 STATE = {"started": False, "last_sent": {}}
-MODE  = {"current": "normal"}     # normal / sniper (se puede extender a suave si quieres)
+MODE  = {"current": "normal"}     # "normal" o "sniper"
 MONITOR_ACTIVE = True
 
 RELAX = {
@@ -74,6 +75,11 @@ RELAX = {
     "EMA_SOFT_EPS": 0.0005,
     "ALLOW_NO_FVG_NORMAL": True
 }
+
+# para el "entrenamiento" inicial
+TRAINING_SAMPLE = 50
+TRAIN_APPROVED = []
+TRAIN_REJECTED = []
 
 # =========================
 # Exchanges (ccxt)
@@ -183,6 +189,7 @@ def build_alert_v21(symbol, side, price, sl, tp1, tp2, zona_valor, confirmacion,
         direccion = "🔴 SHORT 📉"
 
     return (
+        f"🤖 SEÑAL DEL BOT MONSTRUO ⚡️\n"
         f"✨ ALERTA DE TRADING ⚡️ ✨\n\n"
         f"💰 ACTIVO: {symbol}\n"
         f"📉 TEMPORALIDAD: {mode_cfg['MACRO']} / {mode_cfg['CONFIRM2']} / {mode_cfg['EXECUTION']}\n"
@@ -366,7 +373,7 @@ def premium_discount_zone(price, swing_low, swing_high, tol=0.0):
     return "eq", (swing_high + swing_low)/2.0
 
 # =========================
-# Pullback simple en 15m (sin Fibo duro)
+# Pullback simple en 15m
 # =========================
 def simple_pullback_ok(df, is_long: bool, lookback: int = 80,
                        min_pos: float = 0.25, max_pos: float = 0.75,
@@ -449,7 +456,7 @@ def sl_tp(price, is_long, sw5_lo, sw5_hi, sw15_lo, sw15_hi, atr_val, fvg=None, e
     return float(tp1), float(tp2), float(sl)
 
 # =========================
-# Análisis principal
+# Análisis principal de un símbolo
 # =========================
 def analyze_symbol(symbol, mode_cfg, hard_sniper=True):
     df4  = fetch_ohlcv_first_ok(symbol, mode_cfg["MACRO"],    limit=300)
@@ -537,10 +544,7 @@ def analyze_symbol(symbol, mode_cfg, hard_sniper=True):
     block15 = find_valid_block(df15, is_long, bars=50)
     near_block = False
     if block15:
-        # reutilizamos simple_pullback_ok internamente para cercanía aproximada
-        level_df = df15.copy()
-        # truco rápido: medir la distancia en % a ese nivel
-        last_c = float(level_df["close"].iloc[-1])
+        last_c = float(df15["close"].iloc[-1])
         level  = block15["level"]
         if abs(last_c - level)/max(level,1e-9) <= (RELAX["RET_TOL_NORMAL"] if is_normal else RET_TOL):
             near_block = True
@@ -592,7 +596,7 @@ def analyze_symbol(symbol, mode_cfg, hard_sniper=True):
     if time_ok_15 or time_ok_exec:
         notes.append("Time Fibo near") 
 
-    # --- PREMIUM / DISCOUNT (para mensaje + filtro original) ---
+    # --- PREMIUM / DISCOUNT ---
     zone15, eq15 = premium_discount_zone(c15, sw15_lo, sw15_hi, tol=(0.0 if hard_sniper else 0.01))
 
     if is_long:
@@ -613,7 +617,7 @@ def analyze_symbol(symbol, mode_cfg, hard_sniper=True):
     extra = {}
     sw5_lo, sw5_hi = dfE["low"].tail(60).min(), dfE["high"].tail(60).max()
 
-    # ========= GATILLO en 5m (confirmación fina) =========
+    # ========= GATILLO en 5m =========
     dfE = compute_indicators(dfE)
 
     bull_eng = bullish_engulfing(dfE)
@@ -799,6 +803,64 @@ async def collect_candles_and_email():
     )
 
 # =========================
+# ENTRENAMIENTO INICIAL (mensajes 2, 3, 4, 5)
+# =========================
+async def initial_training_cycle():
+    TRAIN_APPROVED.clear()
+    TRAIN_REJECTED.clear()
+
+    # 2) Mensaje: descargando velas
+    await send_tg("📥 Descargando velas para entrenamiento inicial...")
+
+    sample_pairs = ACTIVE_PAIRS[:min(len(ACTIVE_PAIRS), TRAINING_SAMPLE)]
+
+    # 3) Mensaje: entrenando estrategia
+    await send_tg(
+        f"🧠 Entrenando pares con tu estrategia monstruosa "
+        f"(backtest rápido sobre {len(sample_pairs)} pares)..."
+    )
+
+    for sym in sample_pairs:
+        for mk in CONFIG["ACTIVE_MODES"]:
+            mode_cfg = CONFIG["MODES"][mk]
+            try:
+                # Entrenamiento: usar la misma lógica, pero sin modo sniper duro
+                res = analyze_symbol(sym, mode_cfg, hard_sniper=False)
+                if res:
+                    TRAIN_APPROVED.append(sym)
+                else:
+                    TRAIN_REJECTED.append(sym)
+            except Exception as e:
+                print(f"⚠️ Error entrenando {sym}: {e}")
+                TRAIN_REJECTED.append(sym)
+
+    # 4) Mensaje: pares aprobados
+    if TRAIN_APPROVED:
+        uniq_approved = sorted(set(TRAIN_APPROVED))
+        show = ", ".join(uniq_approved[:50])
+        extra_note = ""
+        if len(uniq_approved) > 50:
+            extra_note = f"\n(Se muestran solo 50 de {len(uniq_approved)})."
+        await send_tg(
+            f"✅ PARES APROBADOS ({len(uniq_approved)}) en entrenamiento inicial:\n"
+            f"{show}{extra_note}"
+        )
+    else:
+        await send_tg("⚠️ Ningún par aprobó el filtro completo en el entrenamiento inicial. El bot igual seguirá buscando oportunidades en tiempo real.")
+
+    # 5) Mensaje: pares rechazados
+    if TRAIN_REJECTED:
+        uniq_rejected = sorted(set(TRAIN_REJECTED))
+        show_r = ", ".join(uniq_rejected[:50])
+        extra_note_r = ""
+        if len(uniq_rejected) > 50:
+            extra_note_r = f"\n(Se muestran solo 50 de {len(uniq_rejected)})."
+        await send_tg(
+            f"❌ PARES RECHAZADOS ({len(uniq_rejected)}) en entrenamiento inicial:\n"
+            f"{show_r}{extra_note_r}"
+        )
+
+# =========================
 # Comandos Telegram
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -828,7 +890,6 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Bucles principales
 # =========================
 async def monitor_loop():
-    await _startup_notice()
     while True:
         if not MONITOR_ACTIVE:
             await asyncio.sleep(3); continue
@@ -839,7 +900,8 @@ async def monitor_loop():
             for sym in ACTIVE_PAIRS:
                 try:
                     res = analyze_symbol(sym, mode_cfg, hard_sniper=hard_sniper_flag)
-                    if not res: continue
+                    if not res:
+                        continue
 
                     side = res["side"]
                     price, sl, tp1, tp2 = res["price"], res["sl"], res["tp1"], res["tp2"]
@@ -847,6 +909,7 @@ async def monitor_loop():
                     notes = res["notes"]
 
                     if can_send(sym, side):
+                        # 6) Mensaje de señal de bot (ya marcado en build_alert_v21)
                         msg = build_alert_v21(sym, side, price, sl, tp1, tp2, zona_valor, confirmacion, mode_cfg, notes)
                         await send_tg(msg)
 
@@ -930,6 +993,14 @@ def start_telegram_bot():
 async def main_async():
     start_http()
     start_telegram_bot()
+
+    # 1) Mensaje de inicio
+    await _startup_notice()
+
+    # 2–5) Descarga de velas + entrenamiento + aprobados/rechazados
+    await initial_training_cycle()
+
+    # 6) Ya queda corriendo el monitor y el scheduler
     await asyncio.gather(
         monitor_loop(),
         scheduler_loop(),
