@@ -1,6 +1,6 @@
 ccxt==4.2.100
-numpy==1.26.4
-pandas==2.0.3
+numpy==1.24.3
+pandas==1.5.3
 python-telegram-bot==20.8
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
