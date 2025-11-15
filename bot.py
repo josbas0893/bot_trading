@@ -26,7 +26,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 load_dotenv()
 
 # ---------- CONFIG ----------
-EXCHANGES           = ["kucoin", "bybit", "binance", "okx"]   # fuente de datos
+EXCHANGES           = ["kucoin", "bybit", "okx"]   # fuente de datos
 MAX_PAIRS           = int(os.getenv("MAX_PAIRS", "150"))
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
