@@ -1,10 +1,9 @@
 # ======================================================================
-# Bot V4 – Render 24/7  (polars, modos dinámicos)
-# Comandos Telegram:
-#   /mode suave  → WR ≥ 50 %, trades ≥ 3
-#   /mode normal → WR ≥ 65 %, trades ≥ 10  (defecto)
-#   /mode sniper → WR ≥ 80 %, trades ≥ 20
-#   /status      → modo actual + pares aprobados
+# BotSenalesMultiTF – Render 24/7  (polars, modos dinámicos)
+# 1. Mensaje de inicio personalizado
+# 2. Lista aprobados/no por modo (dinámico)
+# 3. Señales con formato original
+# Comandos: /mode suave|normal|sniper  /status
 # ======================================================================
 
 import os, re, time, math, asyncio, threading, smtplib, ssl, io, pytz
@@ -26,14 +25,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 load_dotenv()
 
 # ---------- CONFIG ----------
-EXCHANGES           = ["kucoin", "bybit", "okx"]   # fuente de datos
+EXCHANGES           = ["kucoin", "binance", "okx"]   # fuente de datos
 MAX_PAIRS           = int(os.getenv("MAX_PAIRS", "150"))
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-PROJECT_NAME        = os.getenv("PROJECT_NAME", "BotV4")
-RUN_EVERY_SEC       = int(os.getenv("RUN_EVERY_SEC", "300"))
+PROJECT_NAME        = "BotSenalesMultiTF"
 DATA_DIR            = "data"
 BACKTEST_DAYS       = 60
+RUN_EVERY_SEC       = int(os.getenv("RUN_EVERY_SEC", "300"))
 
 # ---------- MODOS DINÁMICOS ----------
 MODOS = {
@@ -41,7 +40,7 @@ MODOS = {
     "normal": {"wr": 0.65, "trades": 10, "desc": "Normal – balance"},
     "sniper": {"wr": 0.80, "trades": 20, "desc": "Sniper – muy selectivo"}
 }
-MODE = {"current": "normal"}   # modo por defecto
+MODE = {"current": "normal"}   # modo inicial
 
 MONITOR_ACTIVE = True
 STATE = {"last_sent": {}, "daily_count": defaultdict(int), "last_reset": datetime.now(UTC).date()}
@@ -81,12 +80,12 @@ async def send_tg(text: str):
         print("❌ Telegram:", e)
 
 # ====================================================================
-# COMANDOS DE TELEGRAM
+# COMANDOS TELEGRAM
 # ====================================================================
 async def cmd_start(update, context):
     global MONITOR_ACTIVE
     MONITOR_ACTIVE = True
-    await send_tg("✅ Bot ACTIVADO – IA lista")
+    await send_tg("✅ BotSenalesMultiTF ACTIVADO\n📦 Pares: 150\n⏱️ Escaneo: cada 5 min\n⚙️ Modo inicial: NORMAL")
 
 async def cmd_stop(update, context):
     global MONITOR_ACTIVE
@@ -114,6 +113,19 @@ async def cmd_mode(update, context):
                       f"🎯 Trades mín: <b>{cfg['trades']}</b>")
     else:
         await send_tg("Usa: <code>/mode suave|normal|sniper</code>")
+
+# ====================================================================
+# MENSAJE DE INICIO PERSONALIZADO
+# ====================================================================
+async def startup_notice():
+    mod = MODE["current"]
+    cfg = MODOS[mod]
+    await send_tg(
+        f"✅ <b>BotSenalesMultiTF iniciado</b>\n"
+        f"📦 Pares: <b>{len(build_pairs_list())}</b>\n"
+        f"⏱️ Escaneo: cada <b>{RUN_EVERY_SEC//60} min</b>\n"
+        f"⚙️ Modo inicial: <b>{mod.upper()}</b> ({cfg['desc']})"
+    )
 
 # ====================================================================
 # DESCARGA DE VELAS (multi-exchange)
@@ -359,12 +371,17 @@ def register_signal(d: dict):
 # LOOPS PRINCIPALES
 # ====================================================================
 async def monitor_loop():
+    # 1. mensaje de inicio
+    await startup_notice()
+    # 2. descarga
     await download_all_pares()
+    # 3. back-test + listas
     global APROBADOS
     APROBADOS = await filtra_aprobados()
     if not APROBADOS:
         await send_tg("❌ Ningún par ≥ WR mínimo. Bot detenido.")
         return
+    # 4. empieza a escanear
     await send_tg("🚀 Comenzando escaneo solo de pares aprobados…")
     while True:
         if not MONITOR_ACTIVE:
