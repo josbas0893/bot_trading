@@ -160,37 +160,22 @@ async def download_all_pares():
 # ====================================================================
 # CONSTRUCCIÓN DE PARES (USDT, con fallback si no hay Bitunix)
 # ====================================================================
+# ====================================================================
+# CONSTRUCCIÓN DE PARES (/USDT) – SIN BITUNIX, solo multi-exchange
+# ====================================================================
+
 def build_pairs_list():
     """
-    Intenta usar Bitunix si ccxt lo trae; si no, simplemente junta
-    pares /USDT de los exchanges que sí cargaron (Kucoin, OKX, etc.).
+    Devuelve lista agregada de pares que terminen en /USDT de los exchanges
+    disponibles (kucoin, okx, bybit si se pudo, etc.)
+    Max: MAX_PAIRS
     """
-    bitunix_syms = None
+    agg = []
+    seen = set()
 
-    # Intentar cargar Bitunix si existe en ccxt
-    try:
-        bitunix_class = getattr(ccxt, "bitunix", None)
-        if bitunix_class is not None:
-            bitunix = bitunix_class({"enableRateLimit": True})
-            bitunix.load_markets()
-            bitunix_syms = {s for s in bitunix.symbols if s.endswith("/USDT")}
-            print(f"✅ bitunix detectado en ccxt con {len(bitunix_syms)} símbolos USDT")
-        else:
-            print("ℹ️ ccxt no tiene exchange 'bitunix', se usará universo general /USDT.")
-    except Exception as e:
-        print(f"⚠️ No se pudo cargar bitunix desde ccxt: {e}")
-        bitunix_syms = None
-
-    agg, seen = [], set()
-    for ex in EX_OBJS.values():
+    for name, ex in EX_OBJS.items():
         try:
-            # Solo pares /USDT
             syms = [s for s in ex.symbols if s.endswith("/USDT")]
-
-            # Si tenemos universo de Bitunix, filtrar por esos
-            if bitunix_syms is not None:
-                syms = [s for s in syms if s in bitunix_syms]
-
             for s in syms:
                 if s not in seen:
                     agg.append(s)
@@ -199,11 +184,15 @@ def build_pairs_list():
                     break
             if len(agg) >= MAX_PAIRS:
                 break
-        except Exception:
-            continue
+        except Exception as e:
+            print(f"⚠️ Error leyendo símbolos de {name}: {e}")
 
-    print(f"📌 Total de pares seleccionados: {len(agg)}")
-    return sorted(agg)[:MAX_PAIRS]
+    # Orden alfabético por consistencia
+    agg = sorted(agg)[:MAX_PAIRS]
+
+    print(f"📌 Pares compilados SIN Bitunix: {len(agg)} encontrados")
+    return agg
+
 
 # ====================================================================
 # HELPERS DE VOLATILIDAD
