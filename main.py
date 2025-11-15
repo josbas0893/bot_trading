@@ -1,29 +1,21 @@
 # ======================================================================
 # Bot V4 – Render 24/7  (polars, modos dinámicos, filtros IA-reglas)
-# Comandos Telegram:
-#   /mode suave  → WR ≥ 50 %, trades ≥ 3
-#   /mode normal → WR ≥ 65 %, trades ≥ 10  (defecto)
-#   /mode sniper → WR ≥ 80 %, trades ≥ 20
-#   /status      → modo actual + estado
-#   /start       → re-activa monitoreo
-#   /stop        → pausa monitoreo
+# SIN ApplicationBuilder / Updater (solo envío a Telegram por HTTP)
 # ======================================================================
 
-import os, re, time, math, asyncio, threading, smtplib, ssl, io
-from datetime import datetime, UTC, timedelta
+import os, time, math, asyncio, threading
+from datetime import datetime, UTC
 from email.message import EmailMessage
 from collections import defaultdict
 
 import ccxt
 import numpy as np
 import polars as pl
+import requests
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 import uvicorn
 from dotenv import load_dotenv
-
-from telegram import Bot
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 load_dotenv()
 
@@ -35,7 +27,7 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 PROJECT_NAME        = os.getenv("PROJECT_NAME", "BotV4")
 RUN_EVERY_SEC       = int(os.getenv("RUN_EVERY_SEC", "300"))
 DATA_DIR            = "data"
-BACKTEST_DAYS       = 60     # ya no se usa como filtro duro, solo referencia
+BACKTEST_DAYS       = 60     # referencia, no filtro duro
 
 # ---------- MODOS DINÁMICOS ----------
 MODOS = {
@@ -55,7 +47,7 @@ SCORE_MIN = {
 MONITOR_ACTIVE = True
 STATE = {
     "last_sent": {},     # (symbol, side) -> timestamp
-    "daily_count": defaultdict(int),  # (symbol, side) por día
+    "daily_count": defaultdict(int),  # (symbol, side, date) -> count
     "last_reset": datetime.now(UTC).date()
 }
 DAILY_SIGNALS = []
@@ -82,18 +74,34 @@ init_exchanges()
 # ====================================================================
 # UTILS / TELEGRAM
 # ====================================================================
-def now_ts(): 
+def now_ts():
     return datetime.now(UTC)
 
 async def send_tg(text: str):
+    """
+    Envío async a Telegram usando requests en un executor (no bloquea el loop).
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[TG SIMULADO] {text}")
         return
-    try:
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
-    except Exception as e:
-        print("❌ Telegram:", e)
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    def _post():
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            if not r.ok:
+                print(f"❌ Telegram {r.status_code}: {r.text}")
+        except Exception as e:
+            print(f"❌ Error enviando a Telegram: {e}")
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _post)
 
 def ensure_daily_reset():
     """Resetea contadores diarios a medianoche UTC."""
@@ -103,45 +111,6 @@ def ensure_daily_reset():
         STATE["daily_count"].clear()
         DAILY_SIGNALS.clear()
         print("🔄 Reset diario de contadores")
-
-# ====================================================================
-# COMANDOS DE TELEGRAM
-# ====================================================================
-async def cmd_start(update, context):
-    global MONITOR_ACTIVE
-    MONITOR_ACTIVE = True    # solo afecta el bucle, no reinicia Render
-    await send_tg("✅ Bot ACTIVADO – IA de filtros lista (escaneo continuará en el siguiente ciclo).")
-
-async def cmd_stop(update, context):
-    global MONITOR_ACTIVE
-    MONITOR_ACTIVE = False
-    await send_tg("🛑 Bot DETENIDO. No se enviarán nuevas señales hasta /start.")
-
-async def cmd_status(update, context):
-    mod = MODE["current"]
-    cfg = MODOS[mod]
-    await send_tg(
-        f"📊 <b>ESTADO</b>\n"
-        f"• Modo: <b>{mod.upper()}</b> ({cfg['desc']})\n"
-        f"• WR mín backtest: <b>{cfg['wr']:.0%}</b>\n"
-        f"• Trades mín backtest: <b>{cfg['trades']}</b>\n"
-        f"• Score mín en vivo: <b>{SCORE_MIN[mod]}★</b>\n"
-        f"• Monitoreo: <b>{'ON' if MONITOR_ACTIVE else 'OFF'}</b>"
-    )
-
-async def cmd_mode(update, context):
-    txt = (update.message.text or "").strip().lower().split()
-    if len(txt) >= 2 and txt[1] in MODOS:
-        MODE["current"] = txt[1]
-        cfg = MODOS[txt[1]]
-        await send_tg(
-            f"⚙️ Modo cambiado a <b>{txt[1].upper()}</b>\n"
-            f"📈 WR mín backtest: <b>{cfg['wr']:.0%}</b>\n"
-            f"🎯 Trades mín backtest: <b>{cfg['trades']}</b>\n"
-            f"⭐ Score mín en vivo: <b>{SCORE_MIN[txt[1]]}★</b>"
-        )
-    else:
-        await send_tg("Usa: <code>/mode suave|normal|sniper</code>")
 
 # ====================================================================
 # DESCARGA DE VELAS (multi-exchange)
@@ -161,7 +130,7 @@ def download_once(symbol, tf, limit=1500):
             df = df.with_columns(pl.col("ts").cast(pl.Int64))
             df.write_csv(csv_path(symbol, tf))
             return df
-        except Exception as e:
+        except Exception:
             continue
     return pl.DataFrame()
 
@@ -225,7 +194,6 @@ def has_min_daily_range(df5: pl.DataFrame, min_pct: float = 0.015) -> bool:
     """
     if len(df5) < 100:
         return False
-    # Usamos últimas ~24h si hay datos, si no, todo
     window = 288
     if len(df5) < window:
         df_last = df5
@@ -245,14 +213,11 @@ def has_min_daily_range(df5: pl.DataFrame, min_pct: float = 0.015) -> bool:
 # ====================================================================
 def backtest_pare(symbol):
     df5 = load_or_download(symbol, "5m")
-    # Necesitamos mínimo un poco de histórico
     if len(df5) < 500:
         return {"trades": 0, "wr": 0, "df": pl.DataFrame()}
-    # Filtro de rango mínimo (si no hay movimiento, ni perdamos tiempo)
     if not has_min_daily_range(df5, min_pct=0.015):
         return {"trades": 0, "wr": 0, "df": pl.DataFrame()}
 
-    # --- Indicadores EMA/RSI (setup base) ---
     df5 = df5.with_columns(
         EMA_12=pl.col("close").ewm_mean(span=12),
         EMA_50=pl.col("close").ewm_mean(span=50),
@@ -267,18 +232,16 @@ def backtest_pare(symbol):
     df5 = df5.with_columns(RSI=100 - (100 / (1 + rs)))
 
     trades = []
-    # Backtest simple R-multiple
     for i in range(60, len(df5)-20):
-        c    = df5["close"][i]
-        ema12= df5["EMA_12"][i]
-        ema50= df5["EMA_50"][i]
-        ema200=df5["EMA_200"][i]
-        rsi  = df5["RSI"][i]
-        if pl.is_nan(c): 
+        c     = df5["close"][i]
+        ema12 = df5["EMA_12"][i]
+        ema50 = df5["EMA_50"][i]
+        ema200= df5["EMA_200"][i]
+        rsi   = df5["RSI"][i]
+        if pl.is_nan(c):
             continue
 
         is_long = None
-        # Condición tipo tendencia + pullback suave
         if c > ema200*0.998 and ema12 > ema50*0.998 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
             is_long = True
         elif c < ema200*1.002 and ema12 < ema50*1.002 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
@@ -287,16 +250,15 @@ def backtest_pare(symbol):
         if is_long is None:
             continue
 
-        # SL/TP via rango candle (approx ATR)
         atr = (df5["high"][i] - df5["low"][i]).rolling_mean(14)[i]
-        if pl.is_nan(atr): 
+        if pl.is_nan(atr):
             continue
 
         sl  = c - atr*1.8 if is_long else c + atr*1.8
         tp1 = c + atr*1.8*1.5 if is_long else c - atr*1.8*1.5
 
         fut = df5[i+1:i+21]
-        if len(fut) < 2: 
+        if len(fut) < 2:
             continue
 
         if is_long:
@@ -322,7 +284,6 @@ async def filtra_aprobados():
     pairs = build_pairs_list()
     cfg_mode = MODOS[MODE["current"]]
 
-    # Clasificación por entrenamiento fijo de 65 %
     TRAIN_WR = 0.65
     TRAIN_TRADES_MIN = 3
 
@@ -347,14 +308,12 @@ async def filtra_aprobados():
             menores_65.append(sym)
             txt_lo += f"• {sym} – {wr:.0%} ({tr} trades)\n"
 
-        # Aprobación específica según modo actual
         if wr >= cfg_mode["wr"] and tr >= cfg_mode["trades"]:
             aprobados_modo.append(sym)
 
-    # Enviar resumenes
     if mayores_65:
         await send_tg(txt_hi)
-    if len(menores_65) > 0:
+    if menores_65:
         await send_tg(txt_lo)
 
     await send_tg(
@@ -393,7 +352,6 @@ def analiza_vivo(symbol: str):
     if len(df5) < 60:
         return None
 
-    # Filtro de rango mínimo (evita alts muertas)
     if not has_min_daily_range(df5, min_pct=0.015):
         return None
 
@@ -412,17 +370,14 @@ def analiza_vivo(symbol: str):
     if pl.is_nan(c) or pl.is_nan(ema12) or pl.is_nan(ema50) or pl.is_nan(ema200) or pl.is_nan(rsi):
         return None
 
-    # Volumen relativo: último >= 1.5x media de 20
     if len(df5) >= 21:
         vwin = df5.tail(21)
         v_mean = vwin["volume"][:-1].mean()
         if v_mean is not None and v_mean > 0 and vol < 1.5 * float(v_mean):
             return None
 
-    # Score incremental 1–5
     score = 0
 
-    # 1) Setup de tendencia + pullback
     is_long = None
     if c > ema200*0.998 and ema12 > ema50*0.998 and 35 <= rsi <= 65 and abs(c-ema50)/ema50 <= 0.006:
         is_long = True
@@ -434,19 +389,15 @@ def analiza_vivo(symbol: str):
     if is_long is None:
         return None
 
-    # 2) Rango diario mínimo → ya filtrado arriba, pero sumamos punto de convergencia
-    score += 1
+    score += 1  # rango diario ya filtrado
 
-    # 3) RSI saludable (no extremo)
     if 40 <= rsi <= 60:
         score += 1
 
-    # 4) Score final vs modo
     mode = MODE["current"]
     if score < SCORE_MIN.get(mode, 3):
         return None
 
-    # SL/TP con rango candle actual (simple)
     atr_like = (last["high"][0] - last["low"][0])
     if pl.is_nan(atr_like) or atr_like <= 0:
         return None
@@ -472,7 +423,7 @@ def analiza_vivo(symbol: str):
     }
 
 # ====================================================================
-# ALERTA / REGISTRO  (FORMATO ORIGINAL + SCORE)
+# ALERTA / REGISTRO
 # ====================================================================
 def fmt_price(x):
     try:
@@ -502,7 +453,6 @@ def build_alert(symbol, side, price, sl, tp1, tp2, rr, score=None):
         f"Opera bajo tu propio riesgo. 🍀"
     )
 
-DAILY_SIGNALS = []
 def register_signal(d: dict):
     x = dict(d)
     x["ts"] = now_ts().isoformat()
@@ -512,12 +462,11 @@ def register_signal(d: dict):
 # LOOPS PRINCIPALES
 # ====================================================================
 async def monitor_loop():
-    # Mensaje de arranque
     await send_tg(
         f"🤖 <b>{PROJECT_NAME}</b> iniciado.\n"
         f"Modo actual: <b>{MODE['current'].upper()}</b>\n"
         f"Exchanges de datos: <code>{', '.join(EXCHANGES)}</code>\n"
-        f"Operando 24/7 en mercados de criptomonedas (sin restricción de sesión)."
+        f"Operando 24/7 en mercados de criptomonedas."
     )
 
     await send_tg("🧠 Iniciando descarga y entrenamiento de pares… puede tardar unos minutos la primera vez.")
@@ -527,8 +476,10 @@ async def monitor_loop():
     APROBADOS = await filtra_aprobados()
 
     if not APROBADOS:
-        await send_tg("❌ Ningún par cumple el WR/trades mínimos para el modo actual. Bot en espera. "
-                      "Puedes probar /mode suave para ser menos estricto.")
+        await send_tg(
+            "❌ Ningún par cumple el WR/trades mínimos para el modo actual.\n"
+            "Puedes ajustar la lógica o reducir filtros si quieres más señales."
+        )
         return
 
     await send_tg("🚀 Comenzando escaneo en vivo SOLO de pares aprobados…")
@@ -546,12 +497,10 @@ async def monitor_loop():
                 if not res:
                     continue
 
-                # Límite diario por par/dirección
                 day_key = (sym, res["side"], now_ts().date())
                 if STATE["daily_count"][day_key] >= 2:
                     continue
 
-                # Antispam 30 min mismo par/dirección
                 key = (sym, res["side"])
                 if (now_ts().timestamp() - STATE["last_sent"].get(key, 0)) < 30 * 60:
                     continue
@@ -591,6 +540,7 @@ async def monitor_loop():
 # FASTAPI (keep-alive)
 # ====================================================================
 app = FastAPI()
+
 @app.get("/ping")
 async def ping():
     return {"ok": True, "service": PROJECT_NAME, "time": now_ts().isoformat()}
@@ -608,20 +558,10 @@ def start_http():
     th.start()
 
 # ====================================================================
-# ENTRYPOINT + TELEGRAM POLLING
+# ENTRYPOINT
 # ====================================================================
 async def main_async():
     start_http()
-
-    app_tg = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app_tg.add_handler(CommandHandler("start",  cmd_start))
-    app_tg.add_handler(CommandHandler("stop",   cmd_stop))
-    app_tg.add_handler(CommandHandler("status", cmd_status))
-    app_tg.add_handler(CommandHandler("mode",   cmd_mode))
-
-    th = threading.Thread(target=app_tg.run_polling, daemon=True)
-    th.start()
-
     await monitor_loop()
 
 if __name__ == "__main__":
