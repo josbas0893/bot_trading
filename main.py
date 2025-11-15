@@ -5,7 +5,6 @@
 
 import os, time, math, asyncio, threading
 from datetime import datetime, UTC
-from email.message import EmailMessage
 from collections import defaultdict
 
 import ccxt
@@ -159,19 +158,39 @@ async def download_all_pares():
     return pairs
 
 # ====================================================================
-# CONSTRUCCIÓN DE PARES (solo USDT que existan en Bitunix)
+# CONSTRUCCIÓN DE PARES (USDT, con fallback si no hay Bitunix)
 # ====================================================================
 def build_pairs_list():
-    bitunix = EX_OBJS.get("bitunix")
-    if not bitunix:
-        bitunix = ccxt.bitunix({"enableRateLimit": True})
-        bitunix.load_markets()
-    bitunix_syms = {s for s in bitunix.symbols if s.endswith("/USDT")}
+    """
+    Intenta usar Bitunix si ccxt lo trae; si no, simplemente junta
+    pares /USDT de los exchanges que sí cargaron (Kucoin, OKX, etc.).
+    """
+    bitunix_syms = None
+
+    # Intentar cargar Bitunix si existe en ccxt
+    try:
+        bitunix_class = getattr(ccxt, "bitunix", None)
+        if bitunix_class is not None:
+            bitunix = bitunix_class({"enableRateLimit": True})
+            bitunix.load_markets()
+            bitunix_syms = {s for s in bitunix.symbols if s.endswith("/USDT")}
+            print(f"✅ bitunix detectado en ccxt con {len(bitunix_syms)} símbolos USDT")
+        else:
+            print("ℹ️ ccxt no tiene exchange 'bitunix', se usará universo general /USDT.")
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar bitunix desde ccxt: {e}")
+        bitunix_syms = None
 
     agg, seen = [], set()
     for ex in EX_OBJS.values():
         try:
-            syms = [s for s in ex.symbols if s.endswith("/USDT") and s in bitunix_syms]
+            # Solo pares /USDT
+            syms = [s for s in ex.symbols if s.endswith("/USDT")]
+
+            # Si tenemos universo de Bitunix, filtrar por esos
+            if bitunix_syms is not None:
+                syms = [s for s in syms if s in bitunix_syms]
+
             for s in syms:
                 if s not in seen:
                     agg.append(s)
@@ -182,6 +201,8 @@ def build_pairs_list():
                 break
         except Exception:
             continue
+
+    print(f"📌 Total de pares seleccionados: {len(agg)}")
     return sorted(agg)[:MAX_PAIRS]
 
 # ====================================================================
