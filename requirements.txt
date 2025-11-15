@@ -1,9 +1,7 @@
-ccxt==4.2.100
-polars==1.17.0
-numpy==1.26.4
-python-telegram-bot==20.8
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-dotenv==1.0.0
-openpyxl==3.1.2
-pytz==2023.3
+ccxt>=4.3.0
+numpy>=1.26.0
+polars>=1.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-telegram-bot>=20.0
+python-dotenv>=1.0.0
