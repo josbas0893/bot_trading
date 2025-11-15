@@ -1,10 +1,10 @@
 # ======================================================================
-# Bot V4 – Render 24/7  (sin pandas, solo polars)
-# 1. Descarga velas 4h/1h/15m/5m (multi-exchange)
-# 2. Back-test individual ≥ 65 % WR → lista blanca
-# 3. Manda lista por Telegram: aprobados vs no aprobados
-# 4. Escanía y manda SEÑALES (solo aprobados, formato original)
-# 5. No tradea automáticamente
+# Bot V4 – Render 24/7  (polars, modos dinámicos)
+# Comandos Telegram:
+#   /mode suave  → WR ≥ 50 %, trades ≥ 3
+#   /mode normal → WR ≥ 65 %, trades ≥ 10  (defecto)
+#   /mode sniper → WR ≥ 80 %, trades ≥ 20
+#   /status      → modo actual + pares aprobados
 # ======================================================================
 
 import os, re, time, math, asyncio, threading, smtplib, ssl, io, pytz
@@ -26,28 +26,29 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 load_dotenv()
 
 # ---------- CONFIG ----------
-EXCHANGES           = ["kucoin", "bybit", "okx", "binance"]   # ← fuente de datos
+EXCHANGES           = ["kucoin", "bybit", "binance", "okx"]   # fuente de datos
 MAX_PAIRS           = int(os.getenv("MAX_PAIRS", "150"))
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-SMTP_EMAIL          = os.getenv("SMTP_EMAIL", "")
-SMTP_APP_PASSWORD   = os.getenv("SMTP_APP_PASSWORD", "")
-SMTP_TO             = os.getenv("SMTP_TO", SMTP_EMAIL)
 PROJECT_NAME        = os.getenv("PROJECT_NAME", "BotV4")
 RUN_EVERY_SEC       = int(os.getenv("RUN_EVERY_SEC", "300"))
 DATA_DIR            = "data"
 BACKTEST_DAYS       = 60
-WR_MINIMO           = 0.65
-R_COMISION          = 0.0008
-R_SLIPPAGE          = 0.0005
 
-MODE                = {"current": "normal"}
-MONITOR_ACTIVE      = True
-STATE               = {"last_sent": {}, "daily_count": defaultdict(int), "last_reset": datetime.now(UTC).date()}
-DAILY_SIGNALS       = []
+# ---------- MODOS DINÁMICOS ----------
+MODOS = {
+    "suave":  {"wr": 0.50, "trades": 3,  "desc": "Suave – más señales"},
+    "normal": {"wr": 0.65, "trades": 10, "desc": "Normal – balance"},
+    "sniper": {"wr": 0.80, "trades": 20, "desc": "Sniper – muy selectivo"}
+}
+MODE = {"current": "normal"}   # modo por defecto
+
+MONITOR_ACTIVE = True
+STATE = {"last_sent": {}, "daily_count": defaultdict(int), "last_reset": datetime.now(UTC).date()}
+DAILY_SIGNALS = []
 
 # ====================================================================
-# 1. EXCHANGES → fuente de datos (puedes agregar más)
+# EXCHANGES
 # ====================================================================
 EX_OBJS = {}
 def init_exchanges():
@@ -66,7 +67,7 @@ def init_exchanges():
 init_exchanges()
 
 # ====================================================================
-# 2. UTILS / TELEGRAM
+# UTILS / TELEGRAM
 # ====================================================================
 def now_ts(): return datetime.now(UTC)
 
@@ -80,7 +81,42 @@ async def send_tg(text: str):
         print("❌ Telegram:", e)
 
 # ====================================================================
-# 3. DESCARGA DE VELAS (multi-exchange)
+# COMANDOS DE TELEGRAM
+# ====================================================================
+async def cmd_start(update, context):
+    global MONITOR_ACTIVE
+    MONITOR_ACTIVE = True
+    await send_tg("✅ Bot ACTIVADO – IA lista")
+
+async def cmd_stop(update, context):
+    global MONITOR_ACTIVE
+    MONITOR_ACTIVE = False
+    await send_tg("🛑 Bot DETENIDO.")
+
+async def cmd_status(update, context):
+    mod = MODE["current"]
+    cfg = MODOS[mod]
+    await send_tg(
+        f"📊 <b>ESTADO</b>\n"
+        f"• Modo: <b>{mod.upper()}</b> ({cfg['desc']})\n"
+        f"• WR mín: <b>{cfg['wr']:.0%}</b>\n"
+        f"• Trades mín: <b>{cfg['trades']}</b>\n"
+        f"• Monitoreo: <b>{'ON' if MONITOR_ACTIVE else 'OFF'}</b>"
+    )
+
+async def cmd_mode(update, context):
+    txt = (update.message.text or "").strip().lower().split()
+    if len(txt) >= 2 and txt[1] in MODOS:
+        MODE["current"] = txt[1]
+        cfg = MODOS[txt[1]]
+        await send_tg(f"⚙️ Modo cambiado a <b>{txt[1].upper()}</b>\n"
+                      f"📈 WR mín: <b>{cfg['wr']:.0%}</b>\n"
+                      f"🎯 Trades mín: <b>{cfg['trades']}</b>")
+    else:
+        await send_tg("Usa: <code>/mode suave|normal|sniper</code>")
+
+# ====================================================================
+# DESCARGA DE VELAS (multi-exchange)
 # ====================================================================
 def csv_path(symbol, tf):
     return f"{DATA_DIR}/{tf}/{symbol.replace('/', '_')}_{tf}.csv"
@@ -90,7 +126,6 @@ def ensure_dirs():
         os.makedirs(f"{DATA_DIR}/{tf}", exist_ok=True)
 
 def download_once(symbol, tf, limit=1500):
-    # intenta cada exchange hasta conseguir datos
     for ex in EX_OBJS.values():
         try:
             data = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
@@ -127,17 +162,15 @@ async def download_all_pares():
     return pairs
 
 # ====================================================================
-# 4. CONSTRUCCIÓN DE PARES (solo USDT que existan en Bitunix)
+# CONSTRUCCIÓN DE PARES (solo USDT que existan en Bitunix)
 # ====================================================================
 def build_pairs_list():
-    # 1. obtiene lista de Bitunix
     bitunix = EX_OBJS.get("bitunix")
     if not bitunix:
         bitunix = ccxt.bitunix({"enableRateLimit": True})
         bitunix.load_markets()
     bitunix_syms = {s for s in bitunix.symbols if s.endswith("/USDT")}
 
-    # 2. agrega de todos los exchanges sin repetir
     agg, seen = [], set()
     for ex in EX_OBJS.values():
         try:
@@ -155,14 +188,13 @@ def build_pairs_list():
     return sorted(agg)[:MAX_PAIRS]
 
 # ====================================================================
-# 5. BACK-TEST INDIVIDUAL (con polars)
+# BACK-TEST INDIVIDUAL (con polars)
 # ====================================================================
 def backtest_pare(symbol):
     df5 = load_or_download(symbol, "5m")
     if len(df5) < BACKTEST_DAYS * 288:
         return {"trades": 0, "wr": 0, "df": pl.DataFrame()}
 
-    # indicadores
     df5 = df5.with_columns(
         EMA_12=pl.col("close").ewm_mean(span=12),
         EMA_50=pl.col("close").ewm_mean(span=50),
@@ -191,7 +223,6 @@ def backtest_pare(symbol):
             is_long = False
         if is_long is None:
             continue
-        # sl/tp
         atr = (df5["high"][i] - df5["low"][i]).rolling_mean(14)[i]
         if pl.is_nan(atr): continue
         sl  = c - atr*1.8 if is_long else c + atr*1.8
@@ -213,24 +244,25 @@ def backtest_pare(symbol):
     return {"trades": len(df_trades), "wr": wr, "df": df_trades}
 
 # ====================================================================
-# 6. MENSAJE TELEGRAM: APROBADOS vs NO APROBADOS
+# MENSAJE TELEGRAM: APROBADOS vs NO APROBADOS (dinámico por modo)
 # ====================================================================
 async def filtra_aprobados():
     pairs = build_pairs_list()
     aprobados = []
-    txt_ok  = "✅ Estrategia válida (≥65 % WR)\n\n"
-    txt_ko  = "❌ NO aprobados (<65 % WR)\n\n"
+    cfg     = MODOS[MODE["current"]]
+    txt_ok  = f"✅ Estrategia válida (≥{cfg['wr']:.0%} WR, ≥{cfg['trades']} trades) – MODO {MODE['current'].upper()}\n\n"
+    txt_ko  = f"❌ NO aprobados (<{cfg['wr']:.0%} WR o <{cfg['trades']} trades)\n\n"
 
     for sym in pairs:
         res = backtest_pare(sym)
-        if res["wr"] >= WR_MINIMO and res["trades"] >= 10:
+        if res["wr"] >= cfg["wr"] and res["trades"] >= cfg["trades"]:
             aprobados.append(sym)
             txt_ok += f"• {sym}  –  {res['wr']:.0%} ({res['trades']} trades)\n"
         else:
             txt_ko += f"• {sym}  –  {res['wr']:.0%} ({res['trades']} trades)\n"
 
     await send_tg(txt_ok)
-    if len(txt_ko.splitlines()) > 2:   # evita mensaje vacío
+    if len(txt_ko.splitlines()) > 2:
         await send_tg(txt_ko)
 
     await send_tg(f"💎 Total aprobados: {len(aprobados)} / {len(pairs)} pares\n"
@@ -238,7 +270,7 @@ async def filtra_aprobados():
     return aprobados
 
 # ====================================================================
-# 7. INDICADORES (en vivo) con polars
+# INDICADORES (en vivo) con polars
 # ====================================================================
 def compute_indicators(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
@@ -256,7 +288,7 @@ def compute_indicators(df: pl.DataFrame) -> pl.DataFrame:
     return df.drop_nulls()
 
 # ====================================================================
-# 8. ANÁLISIS EN VIVO (solo pares aprobados) con polars
+# ANÁLISIS EN VIVO (solo pares aprobados)
 # ====================================================================
 APROBADOS = []
 
@@ -291,7 +323,7 @@ def analiza_vivo(symbol: str):
     return {"side": side, "price": float(c), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "rr": float(rr)}
 
 # ====================================================================
-# 9. ALERTA / REGISTRO  (TU FORMATO ORIGINAL)
+# ALERTA / REGISTRO  (TU FORMATO ORIGINAL)
 # ====================================================================
 def fmt_price(x):
     try:
@@ -324,18 +356,15 @@ def register_signal(d: dict):
     DAILY_SIGNALS.append(x)
 
 # ====================================================================
-# 10. LOOPS PRINCIPALES
+# LOOPS PRINCIPALES
 # ====================================================================
 async def monitor_loop():
-    # 1. descarga
     await download_all_pares()
-    # 2. back-test + mensajes
     global APROBADOS
     APROBADOS = await filtra_aprobados()
     if not APROBADOS:
-        await send_tg("❌ Ningún par ≥ 65 % WR. Bot detenido.")
+        await send_tg("❌ Ningún par ≥ WR mínimo. Bot detenido.")
         return
-    # 3. empieza a escanear
     await send_tg("🚀 Comenzando escaneo solo de pares aprobados…")
     while True:
         if not MONITOR_ACTIVE:
@@ -366,7 +395,7 @@ async def monitor_loop():
         await asyncio.sleep(RUN_EVERY_SEC)
 
 # ====================================================================
-# 11. FASTAPI (keep-alive)
+# FASTAPI (keep-alive)
 # ====================================================================
 app = FastAPI()
 @app.get("/ping")
@@ -378,10 +407,17 @@ def start_http():
     th.start()
 
 # ====================================================================
-# 12. ENTRYPOINT
+# ENTRYPOINT + TELEGRAM POLLING
 # ====================================================================
 async def main_async():
     start_http()
+    app_tg = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start",  cmd_start))
+    app_tg.add_handler(CommandHandler("stop",   cmd_stop))
+    app_tg.add_handler(CommandHandler("status", cmd_status))
+    app_tg.add_handler(CommandHandler("mode",   cmd_mode))
+    th = threading.Thread(target=app_tg.run_polling, daemon=True)
+    th.start()
     await monitor_loop()
 
 if __name__ == "__main__":
