@@ -1,10 +1,9 @@
 ccxt==4.2.100
 numpy==1.26.4
-pandas==2.1.4
+pandas==2.2.2
 python-telegram-bot==20.8
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-dotenv==1.0.0
 openpyxl==3.1.2
 pytz==2023.3
-
